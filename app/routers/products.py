@@ -53,7 +53,8 @@ def _get_size_or_404(db: Session, product: Product, size_id: uuid.UUID) -> Produ
 
 
 def _generate_unique_sku(db: Session, name: str) -> str:
-    base = slugify(name) or "product"
+    # Section 2 spec: SKU auto-fills as an UPPERCASE slug (e.g. "Pouch Serut" -> "POUCH-SERUT").
+    base = slugify(name, uppercase=True) or "PRODUCT"
     sku = base
     suffix = 2
     while db.query(Product).filter(Product.sku == sku).first() is not None:
