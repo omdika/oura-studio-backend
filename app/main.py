@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from app.routers import auth, cutting_optimizer, materials, pattern_specs, production, products, sales, settings, stock, suppliers
+from app.routers import auth, cutting_optimizer, materials, pattern_specs, production, products, reports, sales, settings, stock, suppliers
 
 app = FastAPI(title="Oura Studios API", version="0.1.0")
 
@@ -14,6 +14,7 @@ app.include_router(cutting_optimizer.router, prefix="/api/v1")
 app.include_router(production.router, prefix="/api/v1")
 app.include_router(settings.router, prefix="/api/v1")
 app.include_router(sales.router, prefix="/api/v1")
+app.include_router(reports.router, prefix="/api/v1")
 
 
 @app.get("/health")
