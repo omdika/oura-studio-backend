@@ -26,6 +26,7 @@ This doc is structured for three audiences reading in parallel:
 | v2.3 | 2026-08-05 | Frontend | **Reports date filtering confirmed + Supabase stack.** `GET /reports/sales?from=&to=&group_by=` date range params confirmed required — backend must filter by `sold_at` date (not return all-time data). **Database stack changed: PostgreSQL → Supabase** — see Section 0. No schema changes. |
 | v2.5 | 2026-08-07 | Frontend | **Hardware purchase: field `length_cm` opsional.** Hardware kini bisa punya `qty` + `length_cm`. Jika `length_cm` diisi: `remaining_length_cm = qty × length_cm` diinisialisasi saat purchase dibuat dan di-track saat dikonsumsi (sama seperti kain). Jika tidak: count-only, `remaining_length_cm` null. **Backend action required:** (1) `POST /materials/{id}/purchases` — jangan reject `length_cm` untuk hardware, inisialisasi `remaining_length_cm = qty × length_cm` jika keduanya hadir; (2) `PATCH /materials/{id}/purchases/{id}` — tambahkan hardware ke blok "reject if consumed" untuk field `qty`/`length_cm` ketika `remaining_length_cm < qty × length_cm`. No schema migration needed — kolom sudah ada. |
 | v2.4 | 2026-08-07 | Frontend | **Live backend integration — API contract clarifications.** iOS app connected to live FastAPI backend. Key discoveries: (1) `POST /pattern-specs` request body must be flat (`fabric_material_id`, `cut_width_cm`, `cut_height_cm` at root level) — not a `fabrics[]` array; `cut_height_cm` is the long dimension (UI calls it "Panjang"); `est_labor_minutes` must be > 0. (2) `DELETE /products/{sku}` hard-deletes with cascade — use `PATCH /products/{sku}` with `{name, is_archived: true}` for soft archive. (3) `GET /production-batches` items have `hpp_*: 0.0` in draft status; `fabric_cost_per_piece` is populated in draft. (4) `POST /cutting-optimizer/layouts` returns only `{ cutting_layout_id }`, not a full layout object. All frontend models updated to match actual response formats — Section 4 should be updated to reflect these as binding contract additions. See `doc/versions/v2.4.md` for full details. |
+| v2.7 | 2026-08-08 | Backend | **Cutting optimizer: primary orientation + waste_pct scale fixed, reported by Frontend.** (1) "Primary orientation" now compares total pieces achievable on the *full* roll (cols × rows) instead of pieces-per-row alone — the old tie-break picked a denser-per-row orientation that wasted most of the roll length whenever its row length was much larger than the alternative's (fabric 150×200cm, cut 150×20cm: was picking rotated at 7 pcs total, now correctly picks normal at 10 pcs total, 0% waste). (2) `waste_pct` in `POST /cutting-optimizer/suggest` is now a decimal fraction (0.0–1.0) instead of a 0–100 percentage — iOS multiplies by 100 for display, so the old scale showed 10% waste as 1000%. Open question flagged, not resolved: the bug report's expected `max_profit` result for this same test case (qty=9, waste_pct=0.05, described as a "10% holdback") doesn't match any implemented or documented behavior — `max_profit` has no holdback logic anywhere in the codebase or handoff, and deliberately under-producing an already-profitable single-candidate item doesn't have an obvious business rationale (the fabric is already paid for). Needs product-owner clarification before building; current `max_profit` for this case correctly returns qty=10 like the other two strategies (nothing to trade off with only one candidate). See Section 4 Cutting Optimizer. |
 | v2.6 | 2026-08-08 | Backend | **Two contract bugs fixed, reported by Frontend.** (1) `GET /reports/dashboard` was missing `today_units_sold` (Int) — now included, sum of units across today's non-cancelled sales order items, defaults to 0. (2) `PATCH /production-batches/{id}/items/{item_id}` was returning the batch-level object (root `id` = batch id) instead of the updated item — now returns the item-level object (root `id` = item id), and adds a previously-undocumented `qty_suggested` field (from the source `cutting_layout_item`, null for manually-entered items). `product_size_id`/`pattern_spec_id` on this item shape are nullable. See Section 4 Reports, Production. |
 
 ---
@@ -677,7 +678,9 @@ POST   /cutting-optimizer/suggest
     layouts: [
       {
         strategy: "max_qty" | "min_waste" | "max_profit",
-        waste_pct: number,
+        waste_pct: number,  -- v2.7: decimal fraction (0.0-1.0), NOT a 0-100 percentage.
+                             -- iOS multiplies by 100 itself for display. Was sent as 0-100
+                             -- before v2.7, a confirmed frontend bug (10% waste showed as 1000%).
         items: [
           { product_size_id, pattern_spec_id, orientation, qty_suggested,
             fabric_length_used_cm, cost_per_piece }
@@ -685,6 +688,13 @@ POST   /cutting-optimizer/suggest
       }
     ]
   }
+  -- v2.7: "primary orientation" (used to pick which orientation an unconstrained candidate
+  --   allocates in) is whichever orientation yields more total pieces on the FULL roll
+  --   (pieces_per_row x floor(fabric_length_cm / row_length_cm)) -- not merely more pieces
+  --   per row. Confirmed bug: comparing pieces-per-row alone picks a "denser but shorter"
+  --   orientation that wastes most of the roll length (e.g. fabric 150x200cm, cut 150x20cm:
+  --   rotated fits 7/row but only 1 row -> 7 total; normal fits 1/row but 10 rows -> 10
+  --   total; normal is correct).
 
 POST   /cutting-optimizer/layouts
   body: { material_purchase_id, chosen from one of the suggested layouts (items array) }

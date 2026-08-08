@@ -11,10 +11,14 @@ the leftover"). The precise two-phase algorithm with `bestMinLen`/`futureMinLeng
 by the v1.4-v1.5 revision-history entry ("See Section 1.5 for full algorithm spec") does NOT
 actually appear in Section 1.5 as written -- that section was never updated with the promised
 detail. What follows is a reconstruction from the one-line revision-history description plus
-the skill's restatement of it, not a transcription of a fully-specified algorithm. Geometry
-conventions, the "primary orientation" tie-break, the 3 strategies' exact ordering heuristics,
-and the waste_pct definition are this implementation's own reasonable choices where the
-handoff is silent -- flagged inline below.
+the skill's restatement of it, not a transcription of a fully-specified algorithm. The 3
+strategies' exact candidate-ordering heuristics are still this implementation's own reasonable
+choices where the handoff is silent -- flagged inline below.
+
+Two more pieces were confirmed by a frontend bug report (2026-08-08) and are no longer
+undocumented guesses: "primary orientation" = whichever orientation yields more total pieces
+on the full roll (cols x rows), not merely more pieces per row; and `waste_pct` is a decimal
+fraction (0.0-1.0), not a 0-100 percentage.
 """
 
 import math
@@ -118,27 +122,41 @@ def compute_best_min_len(fabric_width_cm: float, c: Candidate) -> float:
     return 0.0 if math.isinf(best) else best
 
 
-def _primary_orientation(fabric_width_cm: float, c: Candidate) -> tuple[str, OrientationGeometry, str, OrientationGeometry | None]:
-    """Primary = denser orientation (more pieces per row); ties favor normal. This is this
-    implementation's own tie-break choice -- the handoff doesn't define "primary" explicitly,
-    only that a fallback to the alternate orientation happens when primary yields maxRows=0.
+def _total_pieces_on_full_roll(geom: OrientationGeometry, fabric_length_cm: float) -> int:
+    if geom.pieces_per_row <= 0 or geom.row_length_cm <= 0:
+        return 0
+    return geom.pieces_per_row * int(fabric_length_cm // geom.row_length_cm)
+
+
+def _primary_orientation(
+    fabric_width_cm: float, fabric_length_cm: float, c: Candidate
+) -> tuple[str, OrientationGeometry, str, OrientationGeometry | None]:
+    """Primary = whichever orientation yields more total pieces on the full roll (cols x rows),
+    ties favor normal. Confirmed rule (frontend bug report, 2026-08-08) -- comparing pieces_per_row
+    alone (this function's previous tie-break) picks the orientation with the denser single row
+    even when its row_length_cm is so much larger that far fewer rows fit along the roll overall
+    (e.g. fabric 150x200, cut 150x20: rotated packs 7/row but only 1 row fits in 200cm = 7 total;
+    normal packs 1/row but 10 rows fit = 10 total -- normal is correct, rotated is denser-per-row
+    but worse overall).
     """
     normal = normal_geometry(fabric_width_cm, c.cut_width_cm, c.cut_height_cm)
     if not c.rotation_allowed:
         return "normal", normal, "rotated", None
     rotated = rotated_geometry(fabric_width_cm, c.cut_width_cm, c.cut_height_cm)
-    if rotated.pieces_per_row > normal.pieces_per_row:
+    normal_total = _total_pieces_on_full_roll(normal, fabric_length_cm)
+    rotated_total = _total_pieces_on_full_roll(rotated, fabric_length_cm)
+    if rotated_total > normal_total:
         return "rotated", rotated, "normal", normal
     return "normal", normal, "rotated", rotated
 
 
-def _density(fabric_width_cm: float, c: Candidate) -> float:
+def _density(fabric_width_cm: float, fabric_length_cm: float, c: Candidate) -> float:
     """Pieces produced per cm of fabric length consumed, in the primary orientation --
     the correct metric for "which candidate advances total quantity fastest" (raw
     pieces_per_row alone ignores how much length each row costs, which under/over-values
     candidates whose row_length_cm differs).
     """
-    _, geom, _, _ = _primary_orientation(fabric_width_cm, c)
+    _, geom, _, _ = _primary_orientation(fabric_width_cm, fabric_length_cm, c)
     if geom.pieces_per_row <= 0 or geom.row_length_cm <= 0:
         return 0.0
     return geom.pieces_per_row / geom.row_length_cm
@@ -163,7 +181,7 @@ def allocate(fabric_width_cm: float, fabric_length_cm: float, ordered_candidates
         future_min_length = sum(best_min_lens[i + 1 :])
         available = max(0.0, remaining_length - future_min_length)
 
-        primary_name, primary_geom, alt_name, alt_geom = _primary_orientation(fabric_width_cm, c)
+        primary_name, primary_geom, alt_name, alt_geom = _primary_orientation(fabric_width_cm, fabric_length_cm, c)
 
         rows = math.floor(available / primary_geom.row_length_cm) if primary_geom.pieces_per_row > 0 else 0
         used_name, used_geom = primary_name, primary_geom
@@ -191,7 +209,9 @@ def allocate(fabric_width_cm: float, fabric_length_cm: float, ordered_candidates
     return items, max(0.0, remaining_length)
 
 
-def _top_up_leftover(fabric_width_cm: float, leftover_cm: float, candidates: list[Candidate], items: list[AllocatedItem]) -> tuple[list[AllocatedItem], float]:
+def _top_up_leftover(
+    fabric_width_cm: float, fabric_length_cm: float, leftover_cm: float, candidates: list[Candidate], items: list[AllocatedItem]
+) -> tuple[list[AllocatedItem], float]:
     """Section 1.5 point 3: 'recursively try to fit smaller sizes into the leftover.' Tries
     every candidate, smallest primary row-length first, greedily adding whole rows until the
     leftover strip can't fit another row of anything. Used by the min_waste strategy only.
@@ -200,13 +220,13 @@ def _top_up_leftover(fabric_width_cm: float, leftover_cm: float, candidates: lis
     remaining = leftover_cm
     ordered = sorted(
         (c for c in candidates if is_feasible(fabric_width_cm, c)),
-        key=lambda c: -_density(fabric_width_cm, c),
+        key=lambda c: -_density(fabric_width_cm, fabric_length_cm, c),
     )
     progress = True
     while progress and remaining > 0:
         progress = False
         for c in ordered:
-            primary_name, primary_geom, alt_name, alt_geom = _primary_orientation(fabric_width_cm, c)
+            primary_name, primary_geom, alt_name, alt_geom = _primary_orientation(fabric_width_cm, fabric_length_cm, c)
             for name, geom in ((primary_name, primary_geom), (alt_name, alt_geom)):
                 if geom is None or geom.pieces_per_row <= 0 or geom.row_length_cm <= 0:
                     continue
@@ -244,12 +264,12 @@ def build_layout(
     if strategy == "max_qty":
         # Highest pieces-per-cm-of-length first advances total quantity fastest across the
         # fixed roll length (raw pieces_per_row alone ignores each row's length cost).
-        ordered = sorted(candidates, key=lambda c: -_density(fabric_width_cm, c))
+        ordered = sorted(candidates, key=lambda c: -_density(fabric_width_cm, fabric_length_cm, c))
         items, leftover = allocate(fabric_width_cm, fabric_length_cm, ordered)
     elif strategy == "min_waste":
-        ordered = sorted(candidates, key=lambda c: -_density(fabric_width_cm, c))
+        ordered = sorted(candidates, key=lambda c: -_density(fabric_width_cm, fabric_length_cm, c))
         items, leftover = allocate(fabric_width_cm, fabric_length_cm, ordered)
-        items, leftover = _top_up_leftover(fabric_width_cm, leftover, candidates, items)
+        items, leftover = _top_up_leftover(fabric_width_cm, fabric_length_cm, leftover, candidates, items)
     elif strategy == "max_profit":
         ordered = sorted(
             candidates,
@@ -261,7 +281,9 @@ def build_layout(
 
     total_area = fabric_width_cm * fabric_length_cm
     used_area = sum(item.qty_suggested * next(c.cut_width_cm * c.cut_height_cm for c in candidates if c.product_size_id == item.product_size_id) for item in items) if items else 0.0
-    waste_pct = round(100.0 * (1 - used_area / total_area), 2) if total_area > 0 else 0.0
+    # Decimal fraction (0.0-1.0), not a 0-100 percentage -- iOS multiplies by 100 itself for
+    # display (confirmed frontend bug report, 2026-08-08).
+    waste_pct = round(1 - used_area / total_area, 4) if total_area > 0 else 0.0
 
     return LayoutResult(strategy=strategy, items=items, waste_pct=max(0.0, waste_pct))
 
@@ -294,7 +316,7 @@ def estimate_fabric_cost_per_piece(
     if purchase_length_cm <= 0:
         return 0.0
     cost_per_cm = purchase_total_cost / purchase_length_cm
-    _, geom, _, _ = _primary_orientation(fabric_width_cm, c)
+    _, geom, _, _ = _primary_orientation(fabric_width_cm, purchase_length_cm, c)
     if geom.pieces_per_row <= 0 or geom.row_length_cm <= 0:
         return 0.0
     return (cost_per_cm * geom.row_length_cm) / geom.pieces_per_row
