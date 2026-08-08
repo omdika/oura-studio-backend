@@ -11,7 +11,7 @@ from app.models.pattern import PatternComponent, PatternSpec
 from app.models.production import ProductionBatch, ProductionBatchItem
 from app.models.settings import Setting
 from app.models.stock import StockLedger
-from app.schemas.production import ItemQtyUpdate, ProductionBatchCreate, ProductionBatchOut
+from app.schemas.production import ItemQtyUpdate, ProductionBatchCreate, ProductionBatchItemOut, ProductionBatchOut
 from app.services.hpp import compute_hpp
 
 router = APIRouter(prefix="/production-batches", tags=["production"], dependencies=[Depends(get_current_owner)])
@@ -86,7 +86,7 @@ def list_batches(status_filter: str | None = Query(default=None, alias="status")
     return q.order_by(ProductionBatch.produced_at.desc()).all()
 
 
-@router.patch("/{batch_id}/items/{item_id}", response_model=ProductionBatchOut)
+@router.patch("/{batch_id}/items/{item_id}", response_model=ProductionBatchItemOut)
 def update_item_qty(batch_id: uuid.UUID, item_id: uuid.UUID, body: ItemQtyUpdate, db: Session = Depends(get_db)):
     batch = _get_batch_or_404(db, batch_id)
     if batch.status != "draft":
@@ -100,7 +100,8 @@ def update_item_qty(batch_id: uuid.UUID, item_id: uuid.UUID, body: ItemQtyUpdate
 
     item.qty_actual = body.qty_actual
     db.commit()
-    return _get_batch_or_404(db, batch_id)
+    db.refresh(item)
+    return item
 
 
 @router.delete("/{batch_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -140,7 +141,7 @@ def _hardware_cost_per_unit(db: Session, pattern_spec_id: uuid.UUID) -> float:
 
 
 def _fifo_deduct_hardware(db: Session, material_id: uuid.UUID, qty_needed: float) -> None:
-    """Decrements remaining_qty across a hardware material's purchases, oldest first.
+    """Decrements stock across a hardware material's purchases, oldest first.
 
     Design choice (handoff doesn't specify this): unlike fabric consumption, which is tied to
     a specific material_purchase_id via CuttingLayout, hardware components (PatternComponent)
@@ -148,21 +149,40 @@ def _fifo_deduct_hardware(db: Session, material_id: uuid.UUID, qty_needed: float
     for hardware the way there is for fabric. FIFO deduction mirrors the same approach used
     for POST .../addStockFromBahan. Clamped at 0, never blocks confirm: the physical batch was
     already produced by the time confirm runs, so a hardware bookkeeping shortfall shouldn't
-    prevent recording it -- it just surfaces as remaining_qty hitting 0 rather than going
-    negative, which is a real inventory-accuracy problem to flag to the user out of band.
+    prevent recording it -- it just surfaces as remaining hitting 0 rather than going negative,
+    which is a real inventory-accuracy problem to flag to the user out of band.
+
+    v2.5 -- length-tracked hardware: PatternComponent still only carries one qty_per_unit
+    (no separate "length per unit" field exists, and the handoff explicitly says no migration
+    is needed for v2.5). So qty_per_unit is read as already being expressed in whatever unit
+    a given purchase batch is stocked in -- cm for a purchase with remaining_length_cm set,
+    pcs otherwise -- and qty_needed (qty_per_unit × batch qty, computed by the caller) is
+    deducted from whichever field that purchase tracks. This only stays dimensionally correct
+    if a material's purchase history is consistently one tracking type; see purchase_quantity()
+    in services/material_cost.py for the same caveat on mixed history.
     """
     remaining = qty_needed
     purchases = (
         db.query(MaterialPurchase)
-        .filter(MaterialPurchase.material_id == material_id, MaterialPurchase.remaining_qty > 0)
+        .filter(MaterialPurchase.material_id == material_id)
         .order_by(MaterialPurchase.purchased_at.asc(), MaterialPurchase.created_at.asc())
         .all()
     )
     for purchase in purchases:
         if remaining <= 0:
             break
-        take = min(purchase.remaining_qty, remaining)
-        purchase.remaining_qty -= take
+        if purchase.remaining_length_cm is not None:
+            available = purchase.remaining_length_cm
+            if available <= 0:
+                continue
+            take = min(available, remaining)
+            purchase.remaining_length_cm = max(0.0, available - take)
+        else:
+            available = purchase.remaining_qty or 0.0
+            if available <= 0:
+                continue
+            take = min(available, remaining)
+            purchase.remaining_qty = max(0.0, available - take)
         remaining -= take
 
 

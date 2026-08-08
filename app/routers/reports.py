@@ -75,15 +75,18 @@ def dashboard(db: Session = Depends(get_db)):
 
     revenue = 0.0
     profit = 0.0
+    units_sold = 0
     for order in orders:
         for item in order.items:
             revenue += (item.unit_price - item.discount) * item.qty
             profit += item.line_profit
+            units_sold += item.qty
 
     return DashboardResponse(
         today_revenue=revenue,
         today_order_count=len(orders),
         today_profit=profit,
+        today_units_sold=units_sold,
         low_stock_alerts=_low_stock_alerts(db),
     )
 

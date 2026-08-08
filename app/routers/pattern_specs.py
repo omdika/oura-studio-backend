@@ -8,7 +8,7 @@ from app.database import get_db
 from app.deps import get_current_owner
 from app.models.material import Material, MaterialPurchase
 from app.models.pattern import PatternComponent, PatternSpec
-from app.models.product import ProductSize
+from app.models.product import Product, ProductSize
 from app.models.production import ProductionBatchItem
 from app.schemas.pattern import PatternSpecCreate, PatternSpecOut
 from app.services.pattern_versioning import SpecSaveAction, decide_spec_save_action
@@ -45,8 +45,34 @@ def _validate_material_eligibility(db: Session, body: PatternSpecCreate) -> Mate
     return fabric
 
 
-def _spec_out(spec: PatternSpec) -> PatternSpecOut:
-    return PatternSpecOut.model_validate(spec, from_attributes=True)
+def _spec_out(
+    spec: PatternSpec,
+    product_sku: str | None = None,
+    product_name: str | None = None,
+    size_label: str | None = None,
+    fabric_material_name: str | None = None,
+) -> PatternSpecOut:
+    out = PatternSpecOut.model_validate(spec, from_attributes=True)
+    out.product_sku = product_sku
+    out.product_name = product_name
+    out.size_label = size_label
+    out.fabric_material_name = fabric_material_name
+    return out
+
+
+def _spec_out_enriched(db: Session, spec: PatternSpec) -> PatternSpecOut:
+    """Single-row enrichment lookup for POST/GET {id} — the list endpoint uses a JOIN instead
+    since it's the N+1-prone path the iOS client actually hits per Resep tab load."""
+    size = db.get(ProductSize, spec.product_size_id)
+    product = db.get(Product, size.product_id) if size else None
+    fabric = db.get(Material, spec.fabric_material_id)
+    return _spec_out(
+        spec,
+        product_sku=product.sku if product else None,
+        product_name=product.name if product else None,
+        size_label=size.size_label if size else None,
+        fabric_material_name=fabric.name if fabric else None,
+    )
 
 
 @router.post("", response_model=PatternSpecOut)
@@ -121,7 +147,7 @@ def save_pattern_spec(body: PatternSpecCreate, db: Session = Depends(get_db)):
         .filter(PatternSpec.id == spec.id)
         .first()
     )
-    return _spec_out(spec)
+    return _spec_out_enriched(db, spec)
 
 
 @router.get("", response_model=list[PatternSpecOut])
@@ -133,20 +159,30 @@ def list_pattern_specs(
     include_inactive: bool = False,
     db: Session = Depends(get_db),
 ):
-    q = db.query(PatternSpec).options(joinedload(PatternSpec.components))
-    if product_id is not None or size_label is not None:
-        q = q.join(ProductSize, PatternSpec.product_size_id == ProductSize.id)
-        if product_id is not None:
-            q = q.filter(ProductSize.product_id == product_id)
-        if size_label is not None:
-            q = q.filter(ProductSize.size_label == size_label)
+    # Single JOIN query resolves product/size/fabric names for every spec in one round trip,
+    # instead of the client doing N+1 lookups against /products + /products/{sku}/sizes.
+    q = (
+        db.query(PatternSpec, Product.sku, Product.name, ProductSize.size_label, Material.name)
+        .options(joinedload(PatternSpec.components))
+        .join(ProductSize, PatternSpec.product_size_id == ProductSize.id)
+        .join(Product, ProductSize.product_id == Product.id)
+        .join(Material, PatternSpec.fabric_material_id == Material.id)
+    )
+    if product_id is not None:
+        q = q.filter(ProductSize.product_id == product_id)
+    if size_label is not None:
+        q = q.filter(ProductSize.size_label == size_label)
     if product_size_id is not None:
         q = q.filter(PatternSpec.product_size_id == product_size_id)
     if fabric_material_id is not None:
         q = q.filter(PatternSpec.fabric_material_id == fabric_material_id)
     if not include_inactive:
         q = q.filter(PatternSpec.is_active.is_(True))
-    return [_spec_out(s) for s in q.order_by(PatternSpec.effective_from.desc()).all()]
+    rows = q.order_by(PatternSpec.effective_from.desc()).all()
+    return [
+        _spec_out(spec, product_sku=sku, product_name=pname, size_label=slabel, fabric_material_name=mname)
+        for spec, sku, pname, slabel, mname in rows
+    ]
 
 
 @router.get("/{spec_id}", response_model=PatternSpecOut)
@@ -156,7 +192,7 @@ def get_pattern_spec(spec_id: uuid.UUID, db: Session = Depends(get_db)):
     )
     if spec is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pattern spec not found")
-    return _spec_out(spec)
+    return _spec_out_enriched(db, spec)
 
 
 @router.delete("/{spec_id}", status_code=status.HTTP_204_NO_CONTENT)

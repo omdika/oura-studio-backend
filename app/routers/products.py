@@ -41,6 +41,16 @@ def _get_product_or_404(db: Session, sku: str) -> Product:
     return product
 
 
+def _apply_is_archived(entity, is_archived: bool | None) -> None:
+    if is_archived is None:
+        return
+    if is_archived is False:
+        # Archiving Product/ProductSize is one-way by design (doc/versions/v2.4.md) — reject
+        # explicitly instead of silently ignoring, which would show the iOS client a false success.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unarchiving is not supported")
+    entity.is_archived = True
+
+
 def _get_size_or_404(db: Session, product: Product, size_id: uuid.UUID) -> ProductSize:
     size = (
         db.query(ProductSize)
@@ -176,7 +186,9 @@ def list_products(
 @router.patch("/products/{sku}", response_model=ProductOut)
 def update_product(sku: str, body: ProductUpdate, db: Session = Depends(get_db)):
     product = _get_product_or_404(db, sku)
-    product.name = body.name
+    if body.name is not None:
+        product.name = body.name
+    _apply_is_archived(product, body.is_archived)
     db.commit()
     db.refresh(product)
     return product
@@ -277,6 +289,7 @@ def update_product_size(sku: str, size_id: uuid.UUID, body: ProductSizeUpdate, d
         size.selling_price = body.selling_price
     if body.reorder_min_qty is not None:
         size.reorder_min_qty = body.reorder_min_qty
+    _apply_is_archived(size, body.is_archived)
 
     db.commit()
     db.refresh(size)

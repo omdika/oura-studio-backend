@@ -50,6 +50,8 @@ class ProductionBatchItem(Base):
     fabric_cost_per_piece: Mapped[float] = mapped_column(Numeric(asdecimal=False), nullable=False)
     fabric_length_per_unit_cm: Mapped[float] = mapped_column(Numeric(asdecimal=False), nullable=False)
 
+    cutting_layout_item: Mapped["CuttingLayoutItem | None"] = relationship()
+
     hpp_fabric: Mapped[float] = mapped_column(Numeric(asdecimal=False), nullable=False)
     hpp_pooled_material: Mapped[float] = mapped_column(Numeric(asdecimal=False), nullable=False)
     hpp_hardware: Mapped[float] = mapped_column(Numeric(asdecimal=False), nullable=False)
@@ -58,3 +60,8 @@ class ProductionBatchItem(Base):
     hpp_total: Mapped[float] = mapped_column(Numeric(asdecimal=False), nullable=False)
 
     production_batch: Mapped["ProductionBatch"] = relationship(back_populates="items")
+
+    @property
+    def qty_suggested(self) -> int | None:
+        # No cutting_layout_item for manually-entered batch items (no optimizer layout involved).
+        return self.cutting_layout_item.qty_suggested if self.cutting_layout_item is not None else None

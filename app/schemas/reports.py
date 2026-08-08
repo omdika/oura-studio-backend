@@ -17,6 +17,7 @@ class DashboardResponse(BaseModel):
     today_revenue: float
     today_order_count: int
     today_profit: float
+    today_units_sold: int
     low_stock_alerts: list[LowStockAlert]
 
 

@@ -164,15 +164,33 @@ def create_purchase(material_id: uuid.UUID, body: MaterialPurchaseCreate, db: Se
             raise HTTPException(status_code=400, detail="width_cm and length_cm (both > 0) are required for fabric")
         if body.qty is not None or body.package_label is not None:
             raise HTTPException(status_code=400, detail="qty/package_label are not applicable to fabric purchases")
+    elif material.category == "hardware":
+        # v2.5: hardware may optionally track length_cm (e.g. elastic band, ribbon sold by the
+        # cm but purchased in rolls) alongside the existing count-only qty tracking.
+        if body.qty is None or body.qty <= 0:
+            raise HTTPException(status_code=400, detail="qty (> 0) is required for hardware purchases")
+        if body.length_cm is not None and body.length_cm <= 0:
+            raise HTTPException(status_code=400, detail="length_cm must be > 0 when provided")
+        if body.width_cm is not None:
+            raise HTTPException(status_code=400, detail="width_cm only applies to fabric purchases")
+        if body.package_label is not None:
+            raise HTTPException(status_code=400, detail="package_label only applies to thread purchases")
     else:
         if body.qty is None or body.qty <= 0:
             raise HTTPException(status_code=400, detail="qty (> 0) is required for non-fabric purchases")
         if body.width_cm is not None or body.length_cm is not None:
-            raise HTTPException(status_code=400, detail="width_cm/length_cm only apply to fabric purchases")
+            raise HTTPException(status_code=400, detail="width_cm/length_cm only apply to fabric or hardware purchases")
         if material.category != "thread" and body.package_label is not None:
             raise HTTPException(status_code=400, detail="package_label only applies to thread purchases")
 
     supplier_id = _resolve_supplier(db, body.supplier_id, body.supplier_name)
+
+    if material.category == "fabric":
+        remaining_length_cm = body.length_cm
+    elif material.category == "hardware" and body.length_cm is not None:
+        remaining_length_cm = body.qty * body.length_cm
+    else:
+        remaining_length_cm = None
 
     purchase = MaterialPurchase(
         material_id=material.id,
@@ -183,7 +201,7 @@ def create_purchase(material_id: uuid.UUID, body: MaterialPurchaseCreate, db: Se
         total_cost=body.total_cost,
         supplier_id=supplier_id,
         purchased_at=body.purchased_at,
-        remaining_length_cm=body.length_cm if material.category == "fabric" else None,
+        remaining_length_cm=remaining_length_cm,
         remaining_qty=body.qty if material.category != "fabric" else None,
     )
     db.add(purchase)
@@ -251,10 +269,18 @@ def update_purchase(
             purchase.width_cm = body.width_cm
         if body.length_cm is not None:
             purchase.length_cm = body.length_cm
-            purchase.remaining_length_cm = body.length_cm
         if body.qty is not None:
             purchase.qty = body.qty
             purchase.remaining_qty = body.qty
+
+        if material.category == "fabric":
+            if body.length_cm is not None:
+                purchase.remaining_length_cm = body.length_cm
+        elif material.category == "hardware" and purchase.length_cm is not None:
+            # Length-tracked hardware (v2.5): remaining_length_cm tracks the total (qty ×
+            # length_cm), so editing either field while unconsumed recomputes the total.
+            if body.length_cm is not None or body.qty is not None:
+                purchase.remaining_length_cm = (purchase.qty or 0.0) * purchase.length_cm
 
     if body.total_cost is not None:
         purchase.total_cost = body.total_cost

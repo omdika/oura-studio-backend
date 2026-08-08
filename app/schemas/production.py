@@ -16,9 +16,11 @@ class ProductionBatchItemOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    product_size_id: uuid.UUID
-    pattern_spec_id: uuid.UUID
+    production_batch_id: uuid.UUID
+    product_size_id: uuid.UUID | None
+    pattern_spec_id: uuid.UUID | None
     qty_actual: int
+    qty_suggested: int | None
     cutting_layout_item_id: uuid.UUID | None
     material_purchase_id: uuid.UUID
     fabric_cost_per_piece: float

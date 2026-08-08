@@ -43,7 +43,9 @@ class MaterialPurchase(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     material_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("material.id"), nullable=False)
     width_cm: Mapped[float | None] = mapped_column(Numeric(asdecimal=False), nullable=True)  # fabric only
-    length_cm: Mapped[float | None] = mapped_column(Numeric(asdecimal=False), nullable=True)  # fabric only
+    # fabric: always required. hardware (v2.5): optional -- length-tracked hardware like elastic
+    # band/ribbon, sold by the cm but purchased in rolls. thread/packaging: never used.
+    length_cm: Mapped[float | None] = mapped_column(Numeric(asdecimal=False), nullable=True)
     qty: Mapped[float | None] = mapped_column(Numeric(asdecimal=False), nullable=True)  # thread/hardware only
     package_label: Mapped[str | None] = mapped_column(Text, nullable=True)  # thread only, descriptive
     total_cost: Mapped[float] = mapped_column(Numeric(asdecimal=False), nullable=False)
@@ -51,7 +53,8 @@ class MaterialPurchase(Base):
         UUID(as_uuid=True), ForeignKey("supplier.id"), nullable=True
     )
     purchased_at: Mapped[date] = mapped_column(Date, nullable=False)
-    remaining_length_cm: Mapped[float | None] = mapped_column(Numeric(asdecimal=False), nullable=True)  # fabric only
+    # fabric: length_cm. hardware (v2.5, when length_cm is set): qty × length_cm. otherwise None.
+    remaining_length_cm: Mapped[float | None] = mapped_column(Numeric(asdecimal=False), nullable=True)
     # Additive beyond literal Section 3 DDL: thread/hardware purchases have no dimension to decrement,
     # so remaining_qty tracks partial consumption the same way remaining_length_cm does for fabric
     # (decision confirmed with product owner during Stage 3 planning).

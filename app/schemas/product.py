@@ -10,7 +10,8 @@ class ProductCreate(BaseModel):
 
 
 class ProductUpdate(BaseModel):
-    name: str
+    name: str | None = None
+    is_archived: bool | None = None
 
 
 class ProductOut(BaseModel):
@@ -32,6 +33,7 @@ class ProductSizeCreate(BaseModel):
 class ProductSizeUpdate(BaseModel):
     selling_price: float | None = None
     reorder_min_qty: float | None = None
+    is_archived: bool | None = None
 
 
 class ProductSizeOut(BaseModel):
