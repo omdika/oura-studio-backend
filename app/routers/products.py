@@ -2,7 +2,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from slugify import slugify
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -94,6 +94,31 @@ def _current_stock_qty(db: Session, product_size_id: uuid.UUID) -> int:
     return int(total)
 
 
+def _stock_breakdown_map(db: Session, product_size_ids: list[uuid.UUID]) -> dict[uuid.UUID, tuple[int, int]]:
+    # Returns {product_size_id: (production_stock_qty, manual_stock_qty)}. "manual" bundles
+    # reason='initial' (seed) with reason='adjustment' (addStockFromBahan, manual corrections) --
+    # sale/return/damage are deliberately excluded, they're not a stock *source*.
+    if not product_size_ids:
+        return {}
+    production_case = case((StockLedger.reason == "production", StockLedger.change_qty), else_=0)
+    manual_case = case((StockLedger.reason.in_(["initial", "adjustment"]), StockLedger.change_qty), else_=0)
+    rows = (
+        db.query(
+            StockLedger.product_size_id,
+            func.coalesce(func.sum(production_case), 0),
+            func.coalesce(func.sum(manual_case), 0),
+        )
+        .filter(StockLedger.product_size_id.in_(product_size_ids))
+        .group_by(StockLedger.product_size_id)
+        .all()
+    )
+    return {row[0]: (int(row[1]), int(row[2])) for row in rows}
+
+
+def _stock_breakdown(db: Session, product_size_id: uuid.UUID) -> tuple[int, int]:
+    return _stock_breakdown_map(db, [product_size_id]).get(product_size_id, (0, 0))
+
+
 def _latest_production_item(db: Session, product_size_id: uuid.UUID) -> ProductionBatchItem | None:
     # Must filter status='confirmed' -- draft items always have hpp_*=0 (not computed until
     # confirm, per handoff Production section), so an unfiltered "latest by produced_at" can
@@ -149,14 +174,35 @@ def _size_fields(size: ProductSize) -> dict:
     }
 
 
-def _size_out(size: ProductSize, stock_qty: int) -> ProductSizeOut:
-    return ProductSizeOut(**_size_fields(size), current_stock_qty=stock_qty)
+def _size_out(size: ProductSize, stock_qty: int, production_qty: int, manual_qty: int) -> ProductSizeOut:
+    return ProductSizeOut(
+        **_size_fields(size),
+        current_stock_qty=stock_qty,
+        production_stock_qty=production_qty,
+        manual_stock_qty=manual_qty,
+    )
+
+
+def _hpp_breakdown_out(latest_item: ProductionBatchItem | None) -> HppBreakdownOut | None:
+    if latest_item is None:
+        return None
+    return HppBreakdownOut(
+        fabric=latest_item.hpp_fabric,
+        pooled_material=latest_item.hpp_pooled_material,
+        hardware=latest_item.hpp_hardware,
+        labor=latest_item.hpp_labor,
+        overhead=latest_item.hpp_overhead,
+        total=latest_item.hpp_total,
+    )
 
 
 def _detail_out(
-    size: ProductSize, stock_qty: int, latest_item: ProductionBatchItem | None
+    size: ProductSize,
+    stock_qty: int,
+    production_qty: int,
+    manual_qty: int,
+    latest_item: ProductionBatchItem | None,
 ) -> ProductSizeDetailOut:
-    hpp_breakdown = HppBreakdownOut.model_validate(latest_item, from_attributes=True) if latest_item else None
     margin_pct = (
         compute_margin_pct(size.selling_price, latest_item.hpp_total)
         if size.selling_price is not None and latest_item is not None
@@ -165,15 +211,18 @@ def _detail_out(
     return ProductSizeDetailOut(
         **_size_fields(size),
         current_stock_qty=stock_qty,
-        latest_hpp_breakdown=hpp_breakdown,
+        production_stock_qty=production_qty,
+        manual_stock_qty=manual_qty,
+        latest_hpp_breakdown=_hpp_breakdown_out(latest_item),
         margin_pct=margin_pct,
     )
 
 
 def _size_detail_out(db: Session, size: ProductSize) -> ProductSizeDetailOut:
     stock_qty = _current_stock_qty(db, size.id)
+    production_qty, manual_qty = _stock_breakdown(db, size.id)
     latest_item = _latest_production_item(db, size.id)
-    return _detail_out(size, stock_qty, latest_item)
+    return _detail_out(size, stock_qty, production_qty, manual_qty, latest_item)
 
 
 @router.post("/products", response_model=ProductOut, status_code=status.HTTP_201_CREATED)
@@ -274,7 +323,7 @@ def create_product_size(sku: str, body: ProductSizeCreate, db: Session = Depends
     db.add(size)
     db.commit()
     db.refresh(size)
-    return _size_out(size, 0)
+    return _size_out(size, 0, 0, 0)
 
 
 @router.get("/products/{sku}/sizes", response_model=list[ProductSizeDetailOut])
@@ -293,8 +342,17 @@ def list_product_sizes(
     )
     size_ids = [s.id for s in sizes]
     stock_map = _stock_qty_map(db, size_ids)
+    breakdown_map = _stock_breakdown_map(db, size_ids)
     hpp_map = _latest_hpp_map(db, size_ids)
-    out = [_detail_out(s, stock_map.get(s.id, 0), hpp_map.get(s.id)) for s in sizes]
+    out = [
+        _detail_out(
+            s,
+            stock_map.get(s.id, 0),
+            *breakdown_map.get(s.id, (0, 0)),
+            hpp_map.get(s.id),
+        )
+        for s in sizes
+    ]
     if min_stock is not None:
         out = [o for o in out if o.current_stock_qty >= min_stock]
     return out
@@ -320,7 +378,8 @@ def update_product_size(sku: str, size_id: uuid.UUID, body: ProductSizeUpdate, d
 
     db.commit()
     db.refresh(size)
-    return _size_out(size, _current_stock_qty(db, size.id))
+    production_qty, manual_qty = _stock_breakdown(db, size.id)
+    return _size_out(size, _current_stock_qty(db, size.id), production_qty, manual_qty)
 
 
 @router.delete("/products/{sku}/sizes/{size_id}", response_model=DeleteResultOut)

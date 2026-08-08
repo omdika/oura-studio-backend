@@ -47,15 +47,17 @@ class ProductSizeOut(BaseModel):
     selling_price: float | None
     is_archived: bool
     current_stock_qty: int
+    production_stock_qty: int  # sum of stock_ledger.change_qty where reason='production' (added v2.10)
+    manual_stock_qty: int  # sum of stock_ledger.change_qty where reason IN ('initial','adjustment') (added v2.10)
 
 
 class HppBreakdownOut(BaseModel):
-    hpp_fabric: float
-    hpp_pooled_material: float
-    hpp_hardware: float
-    hpp_labor: float
-    hpp_overhead: float
-    hpp_total: float
+    fabric: float
+    pooled_material: float
+    hardware: float
+    labor: float
+    overhead: float
+    total: float
 
 
 class ProductSizeDetailOut(ProductSizeOut):
