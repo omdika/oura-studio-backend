@@ -95,13 +95,32 @@ def _current_stock_qty(db: Session, product_size_id: uuid.UUID) -> int:
 
 
 def _latest_production_item(db: Session, product_size_id: uuid.UUID) -> ProductionBatchItem | None:
+    # Must filter status='confirmed' -- draft items always have hpp_*=0 (not computed until
+    # confirm, per handoff Production section), so an unfiltered "latest by produced_at" can
+    # return a newer draft's all-zero HPP instead of the last real confirmed cost.
     return (
         db.query(ProductionBatchItem)
         .join(ProductionBatch, ProductionBatchItem.production_batch_id == ProductionBatch.id)
-        .filter(ProductionBatchItem.product_size_id == product_size_id)
+        .filter(ProductionBatchItem.product_size_id == product_size_id, ProductionBatch.status == "confirmed")
         .order_by(ProductionBatch.produced_at.desc())
         .first()
     )
+
+
+def _latest_hpp_map(db: Session, product_size_ids: list[uuid.UUID]) -> dict[uuid.UUID, ProductionBatchItem]:
+    if not product_size_ids:
+        return {}
+    rows = (
+        db.query(ProductionBatchItem)
+        .join(ProductionBatch, ProductionBatchItem.production_batch_id == ProductionBatch.id)
+        .filter(ProductionBatchItem.product_size_id.in_(product_size_ids), ProductionBatch.status == "confirmed")
+        .order_by(ProductionBatch.produced_at.desc())
+        .all()
+    )
+    latest: dict[uuid.UUID, ProductionBatchItem] = {}
+    for item in rows:
+        latest.setdefault(item.product_size_id, item)
+    return latest
 
 
 def _product_size_has_history(db: Session, product_size_id: uuid.UUID) -> bool:
@@ -134,9 +153,9 @@ def _size_out(size: ProductSize, stock_qty: int) -> ProductSizeOut:
     return ProductSizeOut(**_size_fields(size), current_stock_qty=stock_qty)
 
 
-def _size_detail_out(db: Session, size: ProductSize) -> ProductSizeDetailOut:
-    stock_qty = _current_stock_qty(db, size.id)
-    latest_item = _latest_production_item(db, size.id)
+def _detail_out(
+    size: ProductSize, stock_qty: int, latest_item: ProductionBatchItem | None
+) -> ProductSizeDetailOut:
     hpp_breakdown = HppBreakdownOut.model_validate(latest_item, from_attributes=True) if latest_item else None
     margin_pct = (
         compute_margin_pct(size.selling_price, latest_item.hpp_total)
@@ -149,6 +168,12 @@ def _size_detail_out(db: Session, size: ProductSize) -> ProductSizeDetailOut:
         latest_hpp_breakdown=hpp_breakdown,
         margin_pct=margin_pct,
     )
+
+
+def _size_detail_out(db: Session, size: ProductSize) -> ProductSizeDetailOut:
+    stock_qty = _current_stock_qty(db, size.id)
+    latest_item = _latest_production_item(db, size.id)
+    return _detail_out(size, stock_qty, latest_item)
 
 
 @router.post("/products", response_model=ProductOut, status_code=status.HTTP_201_CREATED)
@@ -252,7 +277,7 @@ def create_product_size(sku: str, body: ProductSizeCreate, db: Session = Depends
     return _size_out(size, 0)
 
 
-@router.get("/products/{sku}/sizes", response_model=list[ProductSizeOut])
+@router.get("/products/{sku}/sizes", response_model=list[ProductSizeDetailOut])
 def list_product_sizes(
     sku: str,
     archived: bool = False,
@@ -266,8 +291,10 @@ def list_product_sizes(
         .order_by(ProductSize.size_label)
         .all()
     )
-    stock_map = _stock_qty_map(db, [s.id for s in sizes])
-    out = [_size_out(s, stock_map.get(s.id, 0)) for s in sizes]
+    size_ids = [s.id for s in sizes]
+    stock_map = _stock_qty_map(db, size_ids)
+    hpp_map = _latest_hpp_map(db, size_ids)
+    out = [_detail_out(s, stock_map.get(s.id, 0), hpp_map.get(s.id)) for s in sizes]
     if min_stock is not None:
         out = [o for o in out if o.current_stock_qty >= min_stock]
     return out
