@@ -17,8 +17,8 @@ class ProductionBatchItemOut(BaseModel):
 
     id: uuid.UUID
     production_batch_id: uuid.UUID
-    product_size_id: uuid.UUID | None
-    pattern_spec_id: uuid.UUID | None
+    product_size_id: uuid.UUID
+    pattern_spec_id: uuid.UUID
     qty_actual: int
     qty_suggested: int | None
     cutting_layout_item_id: uuid.UUID | None
