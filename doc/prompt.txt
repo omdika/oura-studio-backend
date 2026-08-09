@@ -1,0 +1,78 @@
+Oura Studio — Backend Task Backlog (as of 2026-08-09)
+=======================================================
+
+Dokumen ini adalah kumpulan semua task backend yang outstanding, diurutkan dari yang paling kritis.
+Versi detail masing-masing task ada di doc/backend/versions/.
+
+---
+
+🔴 CRITICAL — GET /reports/dashboard: field month-level belum ada
+=================================================================
+
+Problem: iOS client crash dengan keyNotFound 'month_revenue' — dashboard dan laporan tidak muncul.
+
+Response saat ini:
+  { "today_revenue": 43333.33, "today_order_count": 3, "today_profit": 17333.33,
+    "today_units_sold": 5, "low_stock_alerts": [] }
+
+Response yang diharapkan (lengkap):
+  {
+    "today_revenue": 43333.33,
+    "today_order_count": 3,
+    "today_profit": 17333.33,
+    "today_units_sold": 5,
+    "month_revenue": 150000.0,
+    "month_orders": 12,
+    "month_units_sold": 28,
+    "month_batches_confirmed": 2,
+    "avg_margin_pct": 0.45,
+    "low_stock_alerts": [...]
+  }
+
+Field yang perlu ditambahkan:
+  month_revenue          float  SUM(total_revenue) dari sales_order di mana sold_at >= date_trunc('month', NOW())
+  month_orders           int    COUNT(*) dari sales_order bulan ini
+  month_units_sold       int    SUM(qty) dari sales_order_item JOIN sales_order bulan ini
+  month_batches_confirmed int   COUNT(*) dari production_batch WHERE status='confirmed' AND confirmed_at >= awal bulan
+  avg_margin_pct         float  AVG(margin_pct) dari product_size WHERE margin_pct IS NOT NULL; return 0.0 jika kosong
+
+Workaround sementara di iOS: field-field ini sudah dijadikan optional (Double?/Int?) di DashboardSummary
+sehingga app tidak crash, tapi angka-angka bulanan tidak tampil.
+
+Ref: doc/backend/versions/v2.11.md
+
+---
+
+🟡 MEDIUM — GET/POST /sales-orders: item fields tidak lengkap
+=============================================================
+
+Problem: response items tidak menyertakan product_name, size_label, sales_order_id;
+root tidak menyertakan total_revenue, total_profit. Nama produk di detail order tampil "Produk · -".
+
+Item response saat ini:
+  { "id": "uuid", "product_size_id": "uuid", "qty": 2, "unit_price": 22000.0,
+    "discount": 0.0, "unit_hpp_snapshot": 8000.0, "line_profit": 28000.0 }
+
+Item response yang diharapkan:
+  { "id": "uuid", "sales_order_id": "uuid", "product_size_id": "uuid",
+    "product_name": "Scrunchie Satin", "size_label": "M · Satin Pelangi",
+    "qty": 2, "unit_price": 22000.0, "discount": 0.0,
+    "unit_hpp_snapshot": 8000.0, "line_profit": 28000.0, "line_revenue": 44000.0 }
+
+Root response tambah 2 field:
+  "total_revenue": 44000.0,
+  "total_profit": 28000.0
+
+Workaround sementara di iOS: field optional dengan nil default; total dihitung client-side dari items.
+
+Ref: doc/backend/versions/v2.11.md
+
+---
+
+SUDAH DIIMPLEMENTASIKAN (referensi)
+====================================
+
+v2.6 — today_units_sold di dashboard + PATCH batch item response → DONE
+v2.7 — Cutting optimizer orientation + waste_pct scale → DONE
+v2.8 — Sizes list: latest_hpp_breakdown + margin_pct → DONE (stale-draft bug juga fixed)
+v2.10 — Sizes list: production_stock_qty + manual_stock_qty + hpp breakdown key rename → DONE
