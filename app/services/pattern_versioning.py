@@ -8,7 +8,7 @@ from enum import Enum
 
 
 class SpecSaveAction(str, Enum):
-    CREATE = "create"  # no active spec exists yet for (product_size_id, fabric_material_id)
+    CREATE = "create"  # no active spec exists yet for this product_size_id
     UPDATE_IN_PLACE = "update_in_place"  # active spec exists, zero ProductionBatchItem rows against it
     NEW_VERSION = "new_version"  # active spec exists, at least one ProductionBatchItem row against it
 

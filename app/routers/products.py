@@ -123,11 +123,18 @@ def _latest_production_item(db: Session, product_size_id: uuid.UUID) -> Producti
     # Must filter status='confirmed' -- draft items always have hpp_*=0 (not computed until
     # confirm, per handoff Production section), so an unfiltered "latest by produced_at" can
     # return a newer draft's all-zero HPP instead of the last real confirmed cost.
+    # Ordered by confirmed_at (v2.12), not produced_at: produced_at is set at batch *creation*,
+    # so if batches are confirmed out of creation order, produced_at.desc() could pick a batch
+    # that was created later but confirmed earlier than another. nullslast() + produced_at
+    # fallback handles batches confirmed before this column existed (confirmed_at=NULL) --
+    # those fall back to produced_at ordering among themselves, and never outrank a batch that
+    # has a real confirmed_at (Postgres' default is NULLS FIRST on DESC, which would otherwise
+    # wrongly rank an old unmigrated NULL ahead of a genuinely more recent confirm).
     return (
         db.query(ProductionBatchItem)
         .join(ProductionBatch, ProductionBatchItem.production_batch_id == ProductionBatch.id)
         .filter(ProductionBatchItem.product_size_id == product_size_id, ProductionBatch.status == "confirmed")
-        .order_by(ProductionBatch.produced_at.desc())
+        .order_by(ProductionBatch.confirmed_at.desc().nullslast(), ProductionBatch.produced_at.desc())
         .first()
     )
 
@@ -139,7 +146,7 @@ def _latest_hpp_map(db: Session, product_size_ids: list[uuid.UUID]) -> dict[uuid
         db.query(ProductionBatchItem)
         .join(ProductionBatch, ProductionBatchItem.production_batch_id == ProductionBatch.id)
         .filter(ProductionBatchItem.product_size_id.in_(product_size_ids), ProductionBatch.status == "confirmed")
-        .order_by(ProductionBatch.produced_at.desc())
+        .order_by(ProductionBatch.confirmed_at.desc().nullslast(), ProductionBatch.produced_at.desc())
         .all()
     )
     latest: dict[uuid.UUID, ProductionBatchItem] = {}
@@ -429,12 +436,16 @@ def add_stock_from_bahan(sku: str, size_id: uuid.UUID, body: AddStockFromBahanRe
     from an existing bahan (fabric) purchase, bypassing the full cutting-optimizer/production-batch
     pipeline. Two things the handoff never spells out (flagged here rather than silently assumed):
 
-    1. Fabric length consumed per unit is approximated as `qty * pattern_spec.cut_height_cm` (cut_width_cm
+    1. Fabric length consumed per unit is approximated as `qty * fabric.cut_height_cm` (cut_width_cm
        is treated as across-the-roll width, not consumed length) -- a straight-line estimate with no
        nesting/rotation optimization. This is only appropriate for manual initial-stock entry; real
        production costing should go through POST /cutting-optimizer/suggest + /production-batches instead.
     2. Because this bypasses ProductionBatch, there is no computed hpp_total to snapshot, so the written
        stock_ledger row has unit_hpp_snapshot=None and reason='adjustment' (not 'production').
+
+    v2.15: a PatternSpec can now carry N fabric layers. `material_purchase_id` (if passed) also
+    disambiguates which fabric layer to consume against; with exactly one fabric layer on the spec
+    it's optional as before.
     """
     product = _get_product_or_404(db, sku)
     size = _get_size_or_404(db, product, size_id)
@@ -454,15 +465,28 @@ def add_stock_from_bahan(sku: str, size_id: uuid.UUID, body: AddStockFromBahanRe
         )
     spec = active_specs[0]
 
-    length_needed_cm = body.qty * spec.cut_height_cm
+    purchase = db.get(MaterialPurchase, body.material_purchase_id) if body.material_purchase_id is not None else None
+    if body.material_purchase_id is not None and purchase is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="material_purchase_id not found")
 
-    if body.material_purchase_id is not None:
-        purchase = db.get(MaterialPurchase, body.material_purchase_id)
-        if purchase is None or purchase.material_id != spec.fabric_material_id:
+    if purchase is not None:
+        fabric = next((f for f in spec.fabrics if f.material_id == purchase.material_id), None)
+        if fabric is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="material_purchase_id not found or does not match this size's fabric material",
+                detail="material_purchase_id does not match any fabric layer of this size's active PatternSpec",
             )
+    elif len(spec.fabrics) == 1:
+        fabric = spec.fabrics[0]
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This PatternSpec has multiple fabric layers — pass material_purchase_id to disambiguate",
+        )
+
+    length_needed_cm = body.qty * fabric.cut_height_cm
+
+    if purchase is not None:
         if (purchase.remaining_length_cm or 0) < length_needed_cm:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Insufficient remaining fabric on this purchase")
         purchase.remaining_length_cm -= length_needed_cm
@@ -470,7 +494,7 @@ def add_stock_from_bahan(sku: str, size_id: uuid.UUID, body: AddStockFromBahanRe
     else:
         candidates = (
             db.query(MaterialPurchase)
-            .filter(MaterialPurchase.material_id == spec.fabric_material_id, MaterialPurchase.remaining_length_cm > 0)
+            .filter(MaterialPurchase.material_id == fabric.material_id, MaterialPurchase.remaining_length_cm > 0)
             .order_by(MaterialPurchase.purchased_at.asc(), MaterialPurchase.created_at.asc())
             .all()
         )

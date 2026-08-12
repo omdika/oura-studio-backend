@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session, joinedload
@@ -132,12 +133,21 @@ def _pooled_material_rate_sum(db: Session) -> float:
 
 
 def _hardware_cost_per_unit(db: Session, pattern_spec_id: uuid.UUID) -> float:
-    components = db.query(PatternComponent).filter(PatternComponent.pattern_spec_id == pattern_spec_id).all()
-    total = 0.0
-    for comp in components:
-        material = db.get(Material, comp.material_id)
-        total += comp.qty_per_unit * (material.current_avg_cost if material else 0.0)
-    return total
+    # PatternComponent is designed to hold hardware-only rows (handoff 1.3: fabric is tracked via
+    # PatternSpecFabric rows (v2.15), pooled materials via settings, not PatternComponent) -- but
+    # POST /pattern-specs doesn't enforce that server-side (only the iOS picker UI restricts it), so
+    # filter defensively here rather than trust every component row is actually hardware.
+    rows = (
+        db.query(PatternComponent, Material)
+        .join(Material, PatternComponent.material_id == Material.id)
+        .filter(
+            PatternComponent.pattern_spec_id == pattern_spec_id,
+            Material.category == "hardware",
+            Material.cost_class == "direct_precise",
+        )
+        .all()
+    )
+    return sum(comp.qty_per_unit * material.current_avg_cost for comp, material in rows)
 
 
 def _fifo_deduct_hardware(db: Session, material_id: uuid.UUID, qty_needed: float) -> None:
@@ -255,5 +265,6 @@ def confirm_batch(batch_id: uuid.UUID, db: Session = Depends(get_db)):
         _fifo_deduct_hardware(db, material_id, qty_used)
 
     batch.status = "confirmed"
+    batch.confirmed_at = datetime.now(timezone.utc)
     db.commit()
     return _get_batch_or_404(db, batch_id)

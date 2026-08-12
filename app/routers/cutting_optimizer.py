@@ -56,12 +56,14 @@ def suggest_layouts(body: SuggestRequest, db: Session = Depends(get_db)):
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"pattern_spec_id {c.pattern_spec_id} does not belong to product_size_id {c.product_size_id}",
             )
-        # v1.3 rule: a candidate's fabric must match the submitted purchase's material -- the
-        # optimizer packs one fabric roll at a time.
-        if spec.fabric_material_id != purchase.material_id:
+        # v1.3/v2.15 rule: a candidate is eligible only if one of its fabric layers matches the
+        # submitted purchase's material -- the optimizer packs one fabric roll at a time. Use that
+        # matching layer's dimensions (not the first fabric) for the geometry.
+        fabric = next((f for f in spec.fabrics if f.material_id == purchase.material_id), None)
+        if fabric is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"pattern_spec_id {c.pattern_spec_id} is for a different fabric material than this purchase",
+                detail=f"pattern_spec_id {c.pattern_spec_id} has no fabric layer for this purchase's material",
             )
 
         product_size = db.get(ProductSize, c.product_size_id)
@@ -72,8 +74,8 @@ def suggest_layouts(body: SuggestRequest, db: Session = Depends(get_db)):
                 purchase.width_cm, purchase.total_cost, purchase.length_cm,
                 Candidate(
                     product_size_id=c.product_size_id, pattern_spec_id=c.pattern_spec_id,
-                    cut_width_cm=spec.cut_width_cm, cut_height_cm=spec.cut_height_cm,
-                    rotation_allowed=spec.rotation_allowed,
+                    cut_width_cm=fabric.cut_width_cm, cut_height_cm=fabric.cut_height_cm,
+                    rotation_allowed=fabric.rotation_allowed,
                 ),
             )
             profit_hint = selling_price - fabric_cost_estimate
@@ -82,9 +84,9 @@ def suggest_layouts(body: SuggestRequest, db: Session = Depends(get_db)):
             Candidate(
                 product_size_id=c.product_size_id,
                 pattern_spec_id=c.pattern_spec_id,
-                cut_width_cm=spec.cut_width_cm,
-                cut_height_cm=spec.cut_height_cm,
-                rotation_allowed=spec.rotation_allowed,
+                cut_width_cm=fabric.cut_width_cm,
+                cut_height_cm=fabric.cut_height_cm,
+                rotation_allowed=fabric.rotation_allowed,
                 min_qty=c.min_qty or 0,
                 profit_per_piece_hint=profit_hint,
             )

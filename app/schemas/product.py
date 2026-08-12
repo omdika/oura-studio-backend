@@ -102,8 +102,9 @@ class StockAdjustmentOut(BaseModel):
 
 class AddStockFromBahanRequest(BaseModel):
     qty: int = Field(gt=0)
-    # Optional: pin consumption to one specific purchase batch. Omit to FIFO across all purchases
-    # of the active PatternSpec's fabric_material_id (oldest purchased_at first).
+    # Optional: pin consumption to one specific purchase batch (also disambiguates which fabric
+    # layer to use when the active PatternSpec has more than one). Omit to FIFO across all
+    # purchases of the spec's single fabric layer's material (oldest purchased_at first).
     material_purchase_id: uuid.UUID | None = None
 
 
