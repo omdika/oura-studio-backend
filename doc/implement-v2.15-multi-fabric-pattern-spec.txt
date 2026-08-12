@@ -1,0 +1,250 @@
+Eksekusi perubahan arsitektur PatternSpec multi-fabric (backend v2.15).
+Baca handoff doc/handoff.md revisi v2.15 untuk konteks lengkap.
+Berikut spec implementasinya:
+
+---
+
+KONTEKS & MOTIVASI
+
+Model lama menyimpan satu kain per PatternSpec sebagai field flat
+(fabric_material_id, cut_width_cm, cut_height_cm, rotation_allowed)
+langsung di tabel pattern_spec. Ini memblokir produk multi-kain seperti
+pouch (batik outer + canvas inner + drill panel): tidak ada cara simpan
+N kain dengan dimensi berbeda dalam satu resep, HPP hanya menghitung
+satu kain, dan optimizer tidak bisa tunjukkan bottleneck.
+
+Solusi: pindahkan fabric fields ke join table pattern_spec_fabric.
+Satu PatternSpec sekarang punya N fabric rows (min 1).
+
+---
+
+1. SCHEMA MIGRATION
+
+1a. Buat tabel baru
+
+    CREATE TABLE pattern_spec_fabric (
+        id                UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        pattern_spec_id   UUID        NOT NULL REFERENCES pattern_spec(id) ON DELETE CASCADE,
+        material_id       UUID        NOT NULL REFERENCES material(id),
+        cut_width_cm      FLOAT       NOT NULL CHECK (cut_width_cm > 0),
+        cut_height_cm     FLOAT       NOT NULL CHECK (cut_height_cm > 0),
+        rotation_allowed  BOOLEAN     NOT NULL DEFAULT TRUE,
+        fabric_label      TEXT,
+        sort_order        INTEGER     NOT NULL DEFAULT 0
+    );
+
+    CREATE INDEX idx_pattern_spec_fabric_spec_id
+        ON pattern_spec_fabric (pattern_spec_id);
+
+    Catatan: validasi category='fabric' dilakukan di application layer,
+    bukan constraint DB.
+
+1b. Migrasi data dari pattern_spec ke pattern_spec_fabric
+
+    INSERT INTO pattern_spec_fabric
+        (pattern_spec_id, material_id, cut_width_cm, cut_height_cm, rotation_allowed, sort_order)
+    SELECT
+        id,
+        fabric_material_id,
+        cut_width_cm,
+        cut_height_cm,
+        rotation_allowed,
+        0
+    FROM pattern_spec
+    WHERE fabric_material_id IS NOT NULL;
+
+1c. Drop kolom lama dari pattern_spec
+
+    ALTER TABLE pattern_spec
+        DROP COLUMN fabric_material_id,
+        DROP COLUMN cut_width_cm,
+        DROP COLUMN cut_height_cm,
+        DROP COLUMN rotation_allowed;
+
+Semua dalam satu Alembic migration dengan upgrade() dan downgrade().
+Downgrade: re-add kolom, populate dari pattern_spec_fabric WHERE
+sort_order=0, drop tabel baru.
+
+---
+
+2. ORM MODELS
+
+PatternSpecFabric model baru:
+
+    class PatternSpecFabric(Base):
+        __tablename__ = "pattern_spec_fabric"
+        id                = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+        pattern_spec_id   = Column(UUID(as_uuid=True), ForeignKey("pattern_spec.id", ondelete="CASCADE"), nullable=False)
+        material_id       = Column(UUID(as_uuid=True), ForeignKey("material.id"), nullable=False)
+        cut_width_cm      = Column(Float, nullable=False)
+        cut_height_cm     = Column(Float, nullable=False)
+        rotation_allowed  = Column(Boolean, default=True, nullable=False)
+        fabric_label      = Column(Text, nullable=True)
+        sort_order        = Column(Integer, default=0, nullable=False)
+
+        material          = relationship("Material")
+
+PatternSpec model — hapus 4 kolom lama, tambah relationship:
+
+    fabrics = relationship(
+        "PatternSpecFabric",
+        order_by="PatternSpecFabric.sort_order",
+        cascade="all, delete-orphan",
+        lazy="selectin"
+    )
+
+---
+
+3. API CHANGES
+
+3a. POST /pattern-specs
+
+Request body berubah dari flat ke array fabrics:
+
+    class FabricLayerIn(BaseModel):
+        material_id:      UUID
+        cut_width_cm:     float = Field(gt=0)
+        cut_height_cm:    float = Field(gt=0)
+        rotation_allowed: bool = True
+        fabric_label:     Optional[str] = None
+
+    class CreatePatternSpecRequest(BaseModel):
+        product_size_id:    UUID
+        fabrics:            List[FabricLayerIn] = Field(min_length=1)
+        est_labor_minutes:  float = Field(gt=0)
+        components:         List[ComponentIn] = []
+
+Validasi yang harus tetap berlaku:
+  - Setiap material_id di fabrics harus punya minimal 1 MaterialPurchase
+  - Setiap material_id harus category='fabric'
+  - product_size_id harus ada
+  - est_labor_minutes > 0
+
+Versioning logic tidak berubah (in-place edit jika used_in_batch_count
+== 0, new version jika sudah dipakai). Ketika buat versi baru: buat
+PatternSpec baru + insert fabric rows dari request ke spec baru.
+
+Save logic:
+  1. Tentukan in-place vs new version (existing logic)
+  2. Simpan PatternSpec record (tanpa fabric fields)
+  3. Bulk-insert pattern_spec_fabric rows dari request.fabrics
+
+3b. GET /pattern-specs dan GET /pattern-specs/{id}
+
+Response shape — fabrics sekarang populated dari join table:
+
+    class FabricLayerOut(BaseModel):
+        id:               UUID
+        material_id:      UUID
+        material_name:    str    # join dengan material.name
+        cut_width_cm:     float
+        cut_height_cm:    float
+        rotation_allowed: bool
+        fabric_label:     Optional[str]
+
+    class PatternSpecOut(BaseModel):
+        id:                  UUID
+        product_size_id:     UUID
+        product_name:        str
+        product_sku:         str
+        size_label:          str
+        fabrics:             List[FabricLayerOut]   # dari join table
+        est_labor_minutes:   float
+        is_active:           bool
+        effective_from:      datetime
+        effective_to:        Optional[datetime]
+        components:          List[ComponentOut]
+        used_in_batch_count: int
+
+Query harus eager-load pattern_spec_fabric + material dalam satu
+query (selectinload atau joinedload) — jangan N+1.
+
+3c. PATCH /pattern-specs/{id} (jika ada endpoint ini)
+
+Terima array fabrics yang sama dengan POST. Full-replace:
+delete semua pattern_spec_fabric rows untuk spec ini, insert baru.
+Hanya boleh jika used_in_batch_count == 0 (aturan in-place edit
+yang sudah ada).
+
+---
+
+4. OPTIMIZER — FILTER CANDIDATES
+
+POST /cutting-optimizer/suggest saat ini filter candidates berdasarkan
+pattern_spec.fabric_material_id == purchase.material_id. Field itu
+sudah tidak ada setelah migrasi. Ganti dengan:
+
+    # Sebelum:
+    spec.fabric_material_id == purchase.material_id
+
+    # Sesudah:
+    purchase.material_id IN [f.material_id for f in spec.fabrics]
+
+Atau sebagai SQL join:
+    INNER JOIN pattern_spec_fabric psf
+        ON psf.pattern_spec_id = ps.id
+        AND psf.material_id = :purchase_material_id
+
+Artinya: spec eligible untuk roll X jika salah satu fabric layer-nya
+menggunakan material X. Optimizer tetap bekerja per-roll — satu
+panggilan suggest = satu material purchase.
+
+Untuk candidate yang eligible, gunakan dimensi dari fabric layer yang
+matching (bukan fabric pertama):
+
+    fabric = next(
+        f for f in spec.fabrics
+        if f.material_id == purchase.material_id
+    )
+    cut_width  = fabric.cut_width_cm
+    cut_height = fabric.cut_height_cm
+    rotation   = fabric.rotation_allowed
+
+---
+
+5. HPP — TIDAK BERUBAH UNTUK FASE INI
+
+Model ProductionBatch tidak berubah sekarang — satu batch tetap
+berasal dari satu CuttingLayout (satu roll kain). Perubahan HPP
+untuk menghitung biaya semua kain sekaligus akan datang bersama
+perubahan Batch model di fase berikutnya. Untuk v2.15 ini, cukup
+pastikan endpoint spec mengembalikan semua fabric layers dengan benar.
+
+---
+
+6. YANG TIDAK BERUBAH
+
+  - product_size, product, material, material_purchase — tidak ada
+    perubahan skema atau endpoint
+  - production_batch, production_batch_item, cutting_layout — tidak
+    ada perubahan (fase berikutnya)
+  - Stock ledger logic — tidak ada perubahan
+  - PatternSpec versioning rule (in-place vs new version) — tidak
+    berubah, hanya cara simpan fabrics yang berubah
+  - pattern_component — tidak berubah
+  - Semua endpoint lain yang tidak menyentuh pattern_spec langsung
+
+---
+
+7. URUTAN PENGERJAAN
+
+  1. Tulis Alembic migration: 1a (create table) → 1b (migrate data)
+     → 1c (drop kolom) dalam satu revision
+  2. Update ORM model PatternSpec (hapus 4 field, tambah relationship)
+  3. Buat ORM model PatternSpecFabric baru
+  4. Update Pydantic schemas (FabricLayerIn, FabricLayerOut,
+     CreatePatternSpecRequest, PatternSpecOut)
+  5. Update POST /pattern-specs handler (terima fabrics[], bulk insert)
+  6. Update GET /pattern-specs query (eager load fabrics + material)
+  7. Update GET /pattern-specs/{id} query (sama)
+  8. Update optimizer candidate filter (join ke pattern_spec_fabric)
+  9. Jalankan alembic upgrade head di environment dev
+ 10. Test manual:
+     - POST /pattern-specs dengan fabrics: [1 kain] → response fabrics
+       array length 1, cut_width/height benar
+     - POST /pattern-specs dengan fabrics: [3 kain] → response fabrics
+       array length 3
+     - GET /pattern-specs → semua spec punya fabrics array terisi
+     - POST /cutting-optimizer/suggest dengan purchase material Batik
+       → hanya returns specs yang punya Batik di antara fabric layers-nya
+     - Spec dengan 0 kain tidak bisa disimpan (400)
