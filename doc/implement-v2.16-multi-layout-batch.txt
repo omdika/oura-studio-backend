@@ -1,0 +1,319 @@
+Eksekusi perubahan backend v2.16: multi-layout production batch untuk produk multi-kain.
+Baca handoff doc/handoff.md revisi v2.16 untuk konteks bisnis lengkap.
+Berikut spec implementasinya:
+
+---
+
+KONTEKS & MOTIVASI
+
+Setelah v2.15, PatternSpec pouch sudah punya N fabric layers (e.g. Satin Pink +
+Waffle Blue + Dakron 5mm). Tapi satu ProductionBatch masih tied ke satu
+cutting_layout (satu roll). Akibatnya user harus buat 3 batch terpisah untuk
+satu sesi produksi pouch — stok bertambah 3× dan HPP fabric hanya dari satu kain.
+
+Solusi v2.16: production_batch dihubungkan ke N cutting_layouts via join table.
+Satu batch = satu sesi produksi lengkap untuk semua kain. HPP fabric = SUM
+cost_per_piece dari semua layouts. Qty item = MIN qty_suggested across layouts
+(bottleneck). Stock deduction: dari semua N purchases sekaligus saat confirm.
+
+---
+
+1. SCHEMA MIGRATION
+
+1a. Buat join table production_batch_layout
+
+    CREATE TABLE production_batch_layout (
+        id                    UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        production_batch_id   UUID        NOT NULL REFERENCES production_batch(id) ON DELETE CASCADE,
+        cutting_layout_id     UUID        NOT NULL REFERENCES cutting_layout(id),
+        sort_order            INTEGER     NOT NULL DEFAULT 0,
+        UNIQUE (production_batch_id, cutting_layout_id)
+    );
+
+    CREATE INDEX idx_pbl_batch ON production_batch_layout (production_batch_id);
+
+1b. Migrasi data dari production_batch.cutting_layout_id ke join table
+
+    INSERT INTO production_batch_layout
+        (production_batch_id, cutting_layout_id, sort_order)
+    SELECT id, cutting_layout_id, 0
+    FROM production_batch
+    WHERE cutting_layout_id IS NOT NULL;
+
+1c. Drop kolom lama dari production_batch
+
+    ALTER TABLE production_batch DROP COLUMN cutting_layout_id;
+
+Catatan: cutting_layout_strategy dan material_name tetap di production_batch —
+keduanya diisi dari layout pertama saat batch dibuat dan tidak berubah.
+
+Semua dalam satu Alembic migration. Downgrade: re-add cutting_layout_id,
+backfill dari production_batch_layout WHERE sort_order=0, drop join table.
+
+---
+
+2. ORM MODELS
+
+Model baru ProductionBatchLayout:
+
+    class ProductionBatchLayout(Base):
+        __tablename__ = "production_batch_layout"
+        id                    = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+        production_batch_id   = Column(UUID(as_uuid=True), ForeignKey("production_batch.id",
+                                    ondelete="CASCADE"), nullable=False)
+        cutting_layout_id     = Column(UUID(as_uuid=True), ForeignKey("cutting_layout.id"),
+                                    nullable=False)
+        sort_order            = Column(Integer, default=0, nullable=False)
+
+        cutting_layout = relationship("CuttingLayout", lazy="joined")
+
+Update ProductionBatch model:
+  - Hapus Column cutting_layout_id (field flat lama)
+  - Tambah relationship:
+
+    layouts = relationship(
+        "ProductionBatchLayout",
+        order_by="ProductionBatchLayout.sort_order",
+        cascade="all, delete-orphan",
+        lazy="selectin"
+    )
+
+  - Tambah computed property untuk backward compat:
+
+    @property
+    def cutting_layout_id(self):
+        # First layout's cutting_layout_id, or None for manual batch
+        return self.layouts[0].cutting_layout_id if self.layouts else None
+
+---
+
+3. PYDANTIC SCHEMAS
+
+3a. Schema request POST /production-batches
+
+    class ProductionBatchCreate(BaseModel):
+        cutting_layout_ids: List[UUID] = []   # empty = manual batch
+        notes: Optional[str] = None
+
+Backward compat: jika client lama mengirim cutting_layout_id (singular),
+terima dengan validator:
+
+    @model_validator(mode='before')
+    def coerce_single_layout(cls, v):
+        if 'cutting_layout_id' in v and 'cutting_layout_ids' not in v:
+            lid = v.pop('cutting_layout_id')
+            v['cutting_layout_ids'] = [lid] if lid else []
+        return v
+
+3b. Schema response GET /production-batches dan GET /production-batches/{id}
+
+    class ProductionBatchOut(BaseModel):
+        id:                      UUID
+        cutting_layout_ids:      List[UUID]      # ordered by sort_order
+        cutting_layout_id:       Optional[UUID]  # alias = cutting_layout_ids[0] if any
+        cutting_layout_strategy: Optional[str]
+        material_name:           Optional[str]
+        produced_at:             datetime
+        confirmed_at:            Optional[datetime]
+        status:                  str
+        notes:                   Optional[str]
+        items:                   List[ProductionBatchItemOut]
+
+    @computed_field
+    def cutting_layout_id(self) -> Optional[UUID]:
+        return self.cutting_layout_ids[0] if self.cutting_layout_ids else None
+
+---
+
+4. HANDLER: POST /production-batches
+
+Logika pembuatan batch dari N cutting layouts:
+
+    def create_production_batch(body: ProductionBatchCreate, db: Session):
+        layout_ids = body.cutting_layout_ids
+
+        # Load layouts
+        layouts = db.query(CuttingLayout).filter(
+            CuttingLayout.id.in_(layout_ids)
+        ).all() if layout_ids else []
+
+        # Validate semua layouts status='suggested' (belum dipakai)
+        for layout in layouts:
+            if layout.status != 'suggested':
+                raise HTTPException(409, f"Layout {layout.id} sudah dipakai")
+
+        # Nama + strategy dari layout pertama (jika ada)
+        first_layout = layouts[0] if layouts else None
+        strategy     = first_layout.strategy if first_layout else None
+        material_name = first_layout.material_purchase.material.name if first_layout else None
+
+        # Buat batch
+        batch = ProductionBatch(
+            cutting_layout_strategy=strategy,
+            material_name=material_name,
+            produced_at=datetime.utcnow(),
+            status='draft',
+            notes=body.notes
+        )
+        db.add(batch)
+        db.flush()  # get batch.id
+
+        # Link layouts ke batch via join table
+        for i, layout in enumerate(layouts):
+            db.add(ProductionBatchLayout(
+                production_batch_id=batch.id,
+                cutting_layout_id=layout.id,
+                sort_order=i
+            ))
+
+        # Build batch items: group by product_size_id across all layouts
+        # Key: product_size_id → list of CuttingLayoutItem dari semua layouts
+        size_to_layout_items: dict[UUID, list] = defaultdict(list)
+        for layout in layouts:
+            for item in layout.items:
+                size_to_layout_items[item.product_size_id].append(item)
+
+        # Untuk manual batch (layout_ids kosong), items diisi user via
+        # POST /production-batches/{id}/items (v2.14) — skip item creation.
+
+        for product_size_id, layout_items in size_to_layout_items.items():
+            spec_id = layout_items[0].pattern_spec_id  # semua items harusnya spec yang sama
+
+            # Bottleneck qty
+            qty_suggested = min(item.qty_suggested for item in layout_items)
+
+            # HPP fabric = sum cost_per_piece dari semua fabric layers
+            fabric_cost = sum(item.cost_per_piece for item in layout_items)
+
+            # HPP non-fabric: hitung dari pattern spec (sama seperti sekarang)
+            labor_cost, overhead_cost, pooled_cost, hardware_cost = \
+                compute_non_fabric_hpp(spec_id, db)
+
+            db.add(ProductionBatchItem(
+                production_batch_id=batch.id,
+                product_size_id=product_size_id,
+                pattern_spec_id=spec_id,
+                qty_actual=qty_suggested,
+                qty_suggested=qty_suggested,
+                fabric_cost_per_piece=fabric_cost,
+                # hpp_* = 0.0 di draft; diisi saat confirm
+                hpp_fabric=0.0, hpp_pooled_material=0.0,
+                hpp_hardware=0.0, hpp_labor=0.0,
+                hpp_overhead=0.0, hpp_total=0.0
+            ))
+
+        db.commit()
+        return batch
+
+compute_non_fabric_hpp() = fungsi existing yang menghitung labor, overhead,
+pooled, hardware dari PatternSpec. Tidak berubah dari implementasi sekarang.
+
+---
+
+5. HANDLER: POST /production-batches/{id}/confirm
+
+Perubahan utama: deduct fabric dari SEMUA linked purchases (bukan hanya satu).
+
+    def confirm_batch(batch_id: UUID, db: Session):
+        batch = ... # load dengan layouts selectin-loaded
+
+        if batch.status != 'draft':
+            raise HTTPException(409, "Hanya batch draft yang bisa dikonfirmasi")
+
+        # Isi HPP final untuk setiap item (sama seperti sekarang)
+        for item in batch.items:
+            hpp = compute_hpp_at_confirm(item, db)
+            item.hpp_fabric          = item.fabric_cost_per_piece
+            item.hpp_pooled_material = hpp.pooled
+            item.hpp_hardware        = hpp.hardware
+            item.hpp_labor           = hpp.labor
+            item.hpp_overhead        = hpp.overhead
+            item.hpp_total           = sum([
+                item.hpp_fabric, item.hpp_pooled_material,
+                item.hpp_hardware, item.hpp_labor, item.hpp_overhead
+            ])
+
+        # Tulis stock_ledger (satu entry per product_size — tidak berubah)
+        for item in batch.items:
+            db.add(StockLedger(
+                product_size_id=item.product_size_id,
+                change_qty=item.qty_actual,
+                reason='production',
+                production_batch_item_id=item.id,
+                unit_hpp_snapshot=item.hpp_total
+            ))
+
+        # Deduct remaining_length_cm dari SEMUA linked purchases
+        for pbl in batch.layouts:  # via relationship
+            layout = pbl.cutting_layout
+            total_used = sum(li.fabric_length_used_cm for li in layout.items)
+            purchase = db.get(MaterialPurchase, layout.material_purchase_id)
+            if purchase and purchase.remaining_length_cm is not None:
+                purchase.remaining_length_cm = max(
+                    0.0,
+                    purchase.remaining_length_cm - total_used
+                )
+            layout.status = 'used'
+
+        batch.status = 'confirmed'
+        batch.confirmed_at = datetime.utcnow()
+        db.commit()
+
+---
+
+6. YANG TIDAK BERUBAH
+
+  - CuttingLayout table/endpoints — tidak ada perubahan
+  - PatternSpec / pattern_spec_fabric — tidak ada perubahan
+  - ProductionBatchItem table — tidak ada perubahan (schema sama)
+  - Stock ledger logic — satu entry per product_size per confirm (tidak berubah)
+  - DELETE /production-batches/{id} — hanya draft; logic tidak berubah
+  - PATCH /production-batches/{id}/items/{item_id} — tidak berubah
+  - Semua endpoint lain yang tidak menyentuh production_batch langsung
+
+---
+
+7. URUTAN PENGERJAAN
+
+  1. Tulis Alembic migration: create join table → migrate data → drop old column
+  2. Update ORM model ProductionBatch (hapus cutting_layout_id column, tambah
+     layouts relationship + computed property)
+  3. Tambah ORM model ProductionBatchLayout baru
+  4. Update Pydantic ProductionBatchCreate (terima cutting_layout_ids + backward compat)
+  5. Update Pydantic ProductionBatchOut (expose cutting_layout_ids + alias cutting_layout_id)
+  6. Update POST /production-batches handler (buat batch items dari N layouts,
+     aggregasi fabric_cost, ambil bottleneck qty)
+  7. Update POST /production-batches/{id}/confirm handler (deduct dari semua
+     linked purchases, mark semua layouts 'used')
+  8. Update GET /production-batches dan GET /production-batches/{id} serialization
+     (pastikan cutting_layout_ids terpopulasi dari join table)
+  9. Jalankan alembic upgrade head di environment dev
+  10. Test manual:
+
+      a. Single-fabric batch (scrunchie):
+         POST /production-batches { "cutting_layout_ids": ["<satin-layout-id>"] }
+         → response.cutting_layout_ids length == 1
+         → response.cutting_layout_id == response.cutting_layout_ids[0]
+         → 1 batch item dengan fabric_cost = cost_per_piece dari layout itu
+         POST confirm → remaining_length_cm berkurang pada satu purchase
+
+      b. Multi-fabric batch (pouch 3 kain):
+         Buat 3 layouts untuk Satin, Waffle, Dakron (masing-masing 1 roll)
+         POST /production-batches {
+           "cutting_layout_ids": ["<satin-id>", "<waffle-id>", "<dakron-id>"]
+         }
+         → response.cutting_layout_ids length == 3
+         → 1 batch item untuk Pouch Free Size
+         → batch_item.fabric_cost_per_piece == satin_cost + waffle_cost + dakron_cost
+         → batch_item.qty_actual == min(satin_qty, waffle_qty, dakron_qty)
+         POST confirm → 3 purchases berkurang; stock_ledger +qty satu entry
+
+      c. Manual batch (tanpa layout):
+         POST /production-batches { "cutting_layout_ids": [] }
+         → response.cutting_layout_ids == []
+         → response.cutting_layout_id == null
+         → items kosong (user tambah via v2.14 endpoint)
+
+      d. Backward compat (client lama):
+         POST /production-batches { "cutting_layout_id": "<some-uuid>" }
+         → diterima tanpa error, dikonversi ke cutting_layout_ids: ["<some-uuid>"]
