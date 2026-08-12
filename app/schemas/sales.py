@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 
 class SalesOrderItemCreate(BaseModel):
@@ -19,20 +19,20 @@ class SalesOrderCreate(BaseModel):
 
 
 class SalesOrderItemOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id: uuid.UUID
+    sales_order_id: uuid.UUID
     product_size_id: uuid.UUID
+    product_name: str
+    size_label: str
     qty: int
     unit_price: float
     discount: float
     unit_hpp_snapshot: float
     line_profit: float
+    line_revenue: float
 
 
 class SalesOrderOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id: uuid.UUID
     invoice_no: str
     customer_name: str | None
@@ -40,6 +40,8 @@ class SalesOrderOut(BaseModel):
     marketplace_fee_pct: float
     status: str
     sold_at: datetime
+    total_revenue: float
+    total_profit: float
     items: list[SalesOrderItemOut]
 
 

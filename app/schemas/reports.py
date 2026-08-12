@@ -18,6 +18,11 @@ class DashboardResponse(BaseModel):
     today_order_count: int
     today_profit: float
     today_units_sold: int
+    month_revenue: float
+    month_orders: int
+    month_units_sold: int
+    month_batches_confirmed: int
+    avg_margin_pct: float
     low_stock_alerts: list[LowStockAlert]
 
 

@@ -1,0 +1,125 @@
+Oura Studio — Backend Verification: HPP Calculation di Confirm Batch
+======================================================================
+Tanggal: 2026-08-10
+
+KONTEKS
+-------
+iOS client menampilkan kartu "RINCIAN HPP" di ProduksiBatchView yang berisi
+5 komponen HPP dari confirmed batch terakhir untuk setiap product_size.
+
+Data flow di iOS:
+  GET /products/{sku}/sizes
+    → field: latest_hpp_breakdown { fabric, pooled_material, hardware, labor, overhead, total }
+    → disimpan per ProductSizeBasic.latestHppBreakdown
+    → ditampilkan sebagai kartu RINCIAN HPP di batch view
+
+Endpoint sizes list (v2.10) sudah diklaim mengembalikan latest_hpp_breakdown.
+Yang BELUM diverifikasi: apakah POST /production-batches/{id}/confirm
+benar-benar menghitung dan menyimpan semua 5 komponen HPP di production_batch_item.
+
+
+TUGAS
+-----
+
+1. CEK kode POST /production-batches/{id}/confirm
+
+   Periksa apakah saat konfirmasi, setiap production_batch_item diisi dengan:
+
+   hpp_fabric
+     = cutting_layout_item.cost_per_piece × item.qty_actual
+     (cost_per_piece = total_fabric_cost_layout ÷ total_pieces_layout)
+
+   hpp_labor
+     = pattern_spec.est_labor_minutes × settings["labor_rate_per_minute"]
+
+   hpp_overhead
+     = settings["default_overhead_per_unit"]
+
+   hpp_pooled_material
+     = settings["pooled_material_rate:thread"] + settings["pooled_material_rate:packaging"]
+
+   hpp_hardware
+     = SUM(component.qty_per_unit × material.current_avg_cost)
+       untuk setiap pattern_spec_component WHERE material.cost_class = 'direct_precise'
+       AND material.category = 'hardware'
+
+   hpp_total
+     = hpp_fabric + hpp_labor + hpp_overhead + hpp_pooled_material + hpp_hardware
+
+   Jika ada field yang masih 0/null/TODO/hardcode: implementasikan rumus di atas.
+
+
+2. CEK query latest_hpp_breakdown di GET /products/{sku}/sizes
+
+   Verifikasi query mengambil dari confirmed batch, bukan draft:
+
+     SELECT
+       hpp_fabric,
+       hpp_pooled_material,
+       hpp_hardware,
+       hpp_labor,
+       hpp_overhead,
+       (hpp_fabric + hpp_pooled_material + hpp_hardware + hpp_labor + hpp_overhead) AS total
+     FROM production_batch_item
+     WHERE product_size_id = $sizeId
+       AND batch.status = 'confirmed'
+     ORDER BY batch.confirmed_at DESC
+     LIMIT 1
+
+   Response key yang diharapkan iOS:
+     {
+       "fabric": 3400.0,
+       "pooled_material": 350.0,
+       "hardware": 120.0,
+       "labor": 2800.0,
+       "overhead": 600.0,
+       "total": 7270.0
+     }
+
+   Pastikan key-nya sudah di-rename sesuai (v2.10 klaim sudah, verifikasi
+   bahwa tidak ada typo atau mixed case).
+
+
+3. VERIFIKASI end-to-end dengan curl
+
+   Setelah confirm sebuah batch, hit endpoint ini:
+     GET /products/{sku}/sizes
+
+   Temukan size yang baru dikonfirmasi. Cek:
+   - latest_hpp_breakdown ada (bukan null)
+   - Semua 6 field hadir (fabric, pooled_material, hardware, labor, overhead, total)
+   - Nilai non-zero (asalkan settings sudah diisi)
+
+   Jika latest_hpp_breakdown masih null setelah confirm: berarti query di
+   poin 2 tidak menemukan confirmed batch — cek JOIN-nya.
+
+   Jika ada field yang 0 padahal settings sudah diisi: berarti rumus di
+   poin 1 belum diimplementasikan untuk komponen tersebut.
+
+
+DEPENDENSI YANG HARUS TERPENUHI
+--------------------------------
+Sebelum test end-to-end, pastikan:
+
+  a) settings table punya nilai non-zero untuk:
+       labor_rate_per_minute
+       default_overhead_per_unit
+       pooled_material_rate:thread
+       pooled_material_rate:packaging
+
+  b) pattern_spec terkait punya:
+       est_labor_minutes > 0
+       minimal 1 komponen hardware (jika ingin hpp_hardware non-zero)
+
+  c) batch yang dikonfirmasi dibuat dari cutting_layout (agar cost_per_piece tersedia)
+     — jika batch dibuat manual tanpa layout, hpp_fabric = 0 adalah expected behavior
+
+
+OUTPUT YANG DIHARAPKAN
+-----------------------
+Laporkan:
+  - Apakah semua 5 komponen sudah dihitung di POST /confirm, atau ada yang missing/stub
+  - Apakah GET /products/{sku}/sizes mengembalikan latest_hpp_breakdown dengan 6 field lengkap
+  - Contoh response JSON aktual dari GET /products/{sku}/sizes setelah confirm
+
+Jika ada yang belum: implementasikan, lalu buat entry di doc/versions/v2.12.md.

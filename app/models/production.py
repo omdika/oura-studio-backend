@@ -18,6 +18,7 @@ class ProductionBatch(Base):
     produced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     status: Mapped[str] = mapped_column(String, nullable=False, default="draft")  # draft | confirmed
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     items: Mapped[list["ProductionBatchItem"]] = relationship(back_populates="production_batch")
 

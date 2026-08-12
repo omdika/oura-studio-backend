@@ -58,35 +58,85 @@ def _low_stock_alerts(db: Session) -> list[LowStockAlert]:
     return alerts
 
 
+def _avg_margin_pct(db: Session) -> float:
+    # Same "latest confirmed item per size" semantics as products.py's _latest_hpp_map --
+    # must filter status='confirmed' or a newer draft's all-zero hpp_total would drag the average down.
+    sizes = db.query(ProductSize).filter(ProductSize.selling_price.isnot(None)).all()
+    if not sizes:
+        return 0.0
+    size_ids = [s.id for s in sizes]
+    rows = (
+        db.query(ProductionBatchItem)
+        .join(ProductionBatch, ProductionBatchItem.production_batch_id == ProductionBatch.id)
+        .filter(ProductionBatchItem.product_size_id.in_(size_ids), ProductionBatch.status == "confirmed")
+        .order_by(ProductionBatch.confirmed_at.desc().nullslast(), ProductionBatch.produced_at.desc())
+        .all()
+    )
+    latest_by_size: dict[uuid.UUID, ProductionBatchItem] = {}
+    for item in rows:
+        latest_by_size.setdefault(item.product_size_id, item)
+
+    margins = [
+        compute_margin_pct(size.selling_price, latest_by_size[size.id].hpp_total)
+        for size in sizes
+        if size.id in latest_by_size
+    ]
+    return sum(margins) / len(margins) if margins else 0.0
+
+
 @router.get("/dashboard", response_model=DashboardResponse)
 def dashboard(db: Session = Depends(get_db)):
-    # "today" per server timezone -- this server runs in UTC (Cloud Run default, no TZ config
-    # exists anywhere else in this app), so UTC is literally the server timezone here.
+    # "today"/"this month" per server timezone -- this server runs in UTC (Cloud Run default, no
+    # TZ config exists anywhere else in this app), so UTC is literally the server timezone here.
     today = datetime.now(timezone.utc).date()
-    start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
-    end = start + timedelta(days=1)
+    day_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+    day_end = day_start + timedelta(days=1)
+    month_start = day_start.replace(day=1)
 
-    orders = (
+    today_orders = (
         db.query(SalesOrder)
         .options(joinedload(SalesOrder.items))
-        .filter(SalesOrder.sold_at >= start, SalesOrder.sold_at < end, SalesOrder.status != "cancelled")
+        .filter(SalesOrder.sold_at >= day_start, SalesOrder.sold_at < day_end, SalesOrder.status != "cancelled")
+        .all()
+    )
+    month_orders_list = (
+        db.query(SalesOrder)
+        .options(joinedload(SalesOrder.items))
+        .filter(SalesOrder.sold_at >= month_start, SalesOrder.sold_at < day_end, SalesOrder.status != "cancelled")
         .all()
     )
 
-    revenue = 0.0
-    profit = 0.0
-    units_sold = 0
-    for order in orders:
+    today_revenue = today_profit = 0.0
+    today_units_sold = 0
+    for order in today_orders:
         for item in order.items:
-            revenue += (item.unit_price - item.discount) * item.qty
-            profit += item.line_profit
-            units_sold += item.qty
+            today_revenue += (item.unit_price - item.discount) * item.qty
+            today_profit += item.line_profit
+            today_units_sold += item.qty
+
+    month_revenue = 0.0
+    month_units_sold = 0
+    for order in month_orders_list:
+        for item in order.items:
+            month_revenue += (item.unit_price - item.discount) * item.qty
+            month_units_sold += item.qty
+
+    month_batches_confirmed = (
+        db.query(ProductionBatch)
+        .filter(ProductionBatch.status == "confirmed", ProductionBatch.confirmed_at >= month_start)
+        .count()
+    )
 
     return DashboardResponse(
-        today_revenue=revenue,
-        today_order_count=len(orders),
-        today_profit=profit,
-        today_units_sold=units_sold,
+        today_revenue=today_revenue,
+        today_order_count=len(today_orders),
+        today_profit=today_profit,
+        today_units_sold=today_units_sold,
+        month_revenue=month_revenue,
+        month_orders=len(month_orders_list),
+        month_units_sold=month_units_sold,
+        month_batches_confirmed=month_batches_confirmed,
+        avg_margin_pct=_avg_margin_pct(db),
         low_stock_alerts=_low_stock_alerts(db),
     )
 

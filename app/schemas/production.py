@@ -41,4 +41,5 @@ class ProductionBatchOut(BaseModel):
     produced_at: datetime
     status: str
     notes: str | None
+    confirmed_at: datetime | None
     items: list[ProductionBatchItemOut]
