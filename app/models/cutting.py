@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, func
+from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -18,6 +18,10 @@ class CuttingLayout(Base):
     status: Mapped[str] = mapped_column(String, nullable=False, default="suggested")  # suggested|used|discarded
     waste_pct: Mapped[float | None] = mapped_column(Numeric(asdecimal=False), nullable=True)
     total_fabric_cost: Mapped[float] = mapped_column(Numeric(asdecimal=False), nullable=False)
+    # v2.16: persisted so a ProductionBatch created from this layout can denormalize it as
+    # cutting_layout_strategy without a join. Was accepted on POST /cutting-optimizer/layouts
+    # (CreateLayoutRequest.strategy) but silently dropped before this column existed.
+    strategy: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     items: Mapped[list["CuttingLayoutItem"]] = relationship(back_populates="cutting_layout")

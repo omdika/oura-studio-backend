@@ -1,4 +1,5 @@
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -9,7 +10,7 @@ from app.deps import get_current_owner
 from app.models.cutting import CuttingLayout, CuttingLayoutItem
 from app.models.material import Material, MaterialPurchase
 from app.models.pattern import PatternComponent, PatternSpec
-from app.models.production import ProductionBatch, ProductionBatchItem
+from app.models.production import ProductionBatch, ProductionBatchItem, ProductionBatchLayout
 from app.models.settings import Setting
 from app.models.stock import StockLedger
 from app.schemas.production import ItemQtyUpdate, ProductionBatchCreate, ProductionBatchItemOut, ProductionBatchOut
@@ -30,53 +31,127 @@ def _get_batch_or_404(db: Session, batch_id: uuid.UUID) -> ProductionBatch:
     return batch
 
 
+def _batch_out(batch: ProductionBatch) -> ProductionBatchOut:
+    out = ProductionBatchOut.model_validate(batch, from_attributes=True)
+    out.cutting_layout_ids = [pbl.cutting_layout_id for pbl in batch.layouts]
+    out.cutting_layout_id = out.cutting_layout_ids[0] if out.cutting_layout_ids else None
+    return out
+
+
 @router.post("", response_model=ProductionBatchOut, status_code=status.HTTP_201_CREATED)
 def create_batch(body: ProductionBatchCreate, db: Session = Depends(get_db)):
-    batch = ProductionBatch(status="draft")
+    layout_ids = body.cutting_layout_ids
+    if len(set(layout_ids)) != len(layout_ids):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="cutting_layout_ids has duplicates")
+
+    layouts_by_id: dict[uuid.UUID, CuttingLayout] = {}
+    if layout_ids:
+        found = db.query(CuttingLayout).filter(CuttingLayout.id.in_(layout_ids)).all()
+        layouts_by_id = {layout.id: layout for layout in found}
+        missing = [str(lid) for lid in layout_ids if lid not in layouts_by_id]
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"Cutting layout(s) not found: {', '.join(missing)}"
+            )
+        for lid in layout_ids:
+            layout = layouts_by_id[lid]
+            if layout.status != "suggested":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Cutting layout {lid} must be status='suggested' to start a production batch from it",
+                )
+
+    layouts = [layouts_by_id[lid] for lid in layout_ids]  # preserves caller-specified order
+
+    # Name/strategy come from the first layout (order as given by the caller), matching the
+    # implement doc's "layout pertama" -- these are denormalized once at creation and never change.
+    first_layout = layouts[0] if layouts else None
+    strategy = first_layout.strategy if first_layout else None
+    material_name = None
+    if first_layout is not None:
+        purchase = db.get(MaterialPurchase, first_layout.material_purchase_id)
+        material = db.get(Material, purchase.material_id) if purchase else None
+        material_name = material.name if material else None
+
+    batch = ProductionBatch(
+        status="draft", notes=body.notes, cutting_layout_strategy=strategy, material_name=material_name
+    )
     db.add(batch)
     db.flush()
 
-    if body.cutting_layout_id is not None:
-        layout = db.get(CuttingLayout, body.cutting_layout_id)
-        if layout is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cutting layout not found")
-        if layout.status != "suggested":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Cutting layout must be status='suggested' to start a production batch from it",
-            )
-
-        batch.cutting_layout_id = layout.id
-        layout_items = db.query(CuttingLayoutItem).filter(CuttingLayoutItem.cutting_layout_id == layout.id).all()
-        for li in layout_items:
-            db.add(
-                ProductionBatchItem(
-                    production_batch_id=batch.id,
-                    product_size_id=li.product_size_id,
-                    pattern_spec_id=li.pattern_spec_id,
-                    qty_actual=li.qty_suggested,
-                    cutting_layout_item_id=li.id,
-                    material_purchase_id=layout.material_purchase_id,
-                    fabric_cost_per_piece=li.cost_per_piece,
-                    fabric_length_per_unit_cm=li.fabric_length_used_cm / li.qty_suggested,
-                    hpp_fabric=0,
-                    hpp_pooled_material=0,
-                    hpp_hardware=0,
-                    hpp_labor=0,
-                    hpp_overhead=0,
-                    hpp_total=0,
-                )
-            )
+    for sort_order, layout in enumerate(layouts):
+        db.add(ProductionBatchLayout(production_batch_id=batch.id, cutting_layout_id=layout.id, sort_order=sort_order))
         # Matches the discard endpoint's invariant: status='used' once a batch exists from this layout.
         layout.status = "used"
 
+    # Build batch items, one per product_size_id across all linked layouts. Two-level aggregation,
+    # not a flat "group everything by product_size_id" (the implement doc's pseudocode does that,
+    # but it's wrong when a *single* layout already places one size across two orientations to use
+    # leftover space -- e.g. 48 normal + 7 rotated pieces of the same size from the same roll. Those
+    # must SUM (55 total pieces from one fabric, qty-weighted average cost), not MIN/bottleneck --
+    # MIN only makes sense *across different fabrics* (a joint product limited by whichever fabric
+    # runs out first), not across orientations of the same fabric.
+    per_layout_size: dict[tuple[uuid.UUID, uuid.UUID], dict] = {}
+    for layout in layouts:
+        items = db.query(CuttingLayoutItem).filter(CuttingLayoutItem.cutting_layout_id == layout.id).all()
+        for li in items:
+            key = (li.product_size_id, layout.id)
+            agg = per_layout_size.setdefault(
+                key, {"qty": 0, "cost_total": 0.0, "len_total": 0.0, "spec_id": li.pattern_spec_id, "items": []}
+            )
+            agg["qty"] += li.qty_suggested
+            agg["cost_total"] += li.cost_per_piece * li.qty_suggested
+            agg["len_total"] += li.fabric_length_used_cm
+            agg["items"].append(li)
+
+    by_size: dict[uuid.UUID, list[tuple[uuid.UUID, dict]]] = defaultdict(list)
+    for (size_id, layout_id), agg in per_layout_size.items():
+        by_size[size_id].append((layout_id, agg))
+
+    # Manual batch (cutting_layout_ids empty): no layouts means no items here -- user adds them
+    # via POST /production-batches/{id}/items (v2.14, not yet implemented as a live endpoint).
+    for size_id, layout_aggs in by_size.items():
+        spec_id = layout_aggs[0][1]["spec_id"]  # all items for one size should share one spec
+        qty = min(agg["qty"] for _, agg in layout_aggs)
+        fabric_cost_per_piece = sum(agg["cost_total"] / agg["qty"] for _, agg in layout_aggs if agg["qty"] > 0)
+
+        if len(layout_aggs) == 1:
+            layout_id, agg = layout_aggs[0]
+            material_purchase_id = layouts_by_id[layout_id].material_purchase_id
+            fabric_length_per_unit_cm = agg["len_total"] / agg["qty"] if agg["qty"] > 0 else None
+            cutting_layout_item_id = agg["items"][0].id if len(agg["items"]) == 1 else None
+        else:
+            material_purchase_id = None
+            fabric_length_per_unit_cm = None
+            cutting_layout_item_id = None
+
+        db.add(
+            ProductionBatchItem(
+                production_batch_id=batch.id,
+                product_size_id=size_id,
+                pattern_spec_id=spec_id,
+                qty_actual=qty,
+                qty_suggested=qty,
+                cutting_layout_item_id=cutting_layout_item_id,
+                material_purchase_id=material_purchase_id,
+                fabric_cost_per_piece=fabric_cost_per_piece,
+                fabric_length_per_unit_cm=fabric_length_per_unit_cm,
+                hpp_fabric=0,
+                hpp_pooled_material=0,
+                hpp_hardware=0,
+                hpp_labor=0,
+                hpp_overhead=0,
+                hpp_total=0,
+            )
+        )
+
     db.commit()
-    return _get_batch_or_404(db, batch.id)
+    return _batch_out(_get_batch_or_404(db, batch.id))
 
 
 @router.get("/{batch_id}", response_model=ProductionBatchOut)
 def get_batch(batch_id: uuid.UUID, db: Session = Depends(get_db)):
-    return _get_batch_or_404(db, batch_id)
+    return _batch_out(_get_batch_or_404(db, batch_id))
 
 
 @router.get("", response_model=list[ProductionBatchOut])
@@ -84,7 +159,8 @@ def list_batches(status_filter: str | None = Query(default=None, alias="status")
     q = db.query(ProductionBatch).options(joinedload(ProductionBatch.items))
     if status_filter is not None:
         q = q.filter(ProductionBatch.status == status_filter)
-    return q.order_by(ProductionBatch.produced_at.desc()).all()
+    batches = q.order_by(ProductionBatch.produced_at.desc()).all()
+    return [_batch_out(b) for b in batches]
 
 
 @router.patch("/{batch_id}/items/{item_id}", response_model=ProductionBatchItemOut)
@@ -111,8 +187,8 @@ def delete_batch(batch_id: uuid.UUID, db: Session = Depends(get_db)):
     if batch.status != "draft":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only draft batches can be deleted")
 
-    if batch.cutting_layout_id is not None:
-        layout = db.get(CuttingLayout, batch.cutting_layout_id)
+    for pbl in batch.layouts:
+        layout = db.get(CuttingLayout, pbl.cutting_layout_id)
         if layout is not None and layout.status == "used":
             layout.status = "suggested"
 
@@ -213,7 +289,6 @@ def confirm_batch(batch_id: uuid.UUID, db: Session = Depends(get_db)):
         )
     pooled_rate = _pooled_material_rate_sum(db)
 
-    fabric_length_by_purchase: dict[uuid.UUID, float] = {}
     hardware_qty_by_material: dict[uuid.UUID, float] = {}
 
     for item in batch.items:
@@ -246,20 +321,22 @@ def confirm_batch(batch_id: uuid.UUID, db: Session = Depends(get_db)):
             )
         )
 
-        fabric_length_by_purchase[item.material_purchase_id] = (
-            fabric_length_by_purchase.get(item.material_purchase_id, 0.0)
-            + item.fabric_length_per_unit_cm * item.qty_actual
-        )
-
         for comp in db.query(PatternComponent).filter(PatternComponent.pattern_spec_id == item.pattern_spec_id).all():
             hardware_qty_by_material[comp.material_id] = (
                 hardware_qty_by_material.get(comp.material_id, 0.0) + comp.qty_per_unit * item.qty_actual
             )
 
-    for purchase_id, length_used in fabric_length_by_purchase.items():
-        purchase = db.get(MaterialPurchase, purchase_id)
+    # v2.16: deduct fabric from every linked layout's own purchase directly (not via the batch
+    # items' material_purchase_id, which is only set for single-fabric items) -- this is also
+    # naturally correct when a layout placed one size across two orientations, since it sums the
+    # layout's own raw CuttingLayoutItems rather than going through per-item aggregation.
+    for pbl in batch.layouts:
+        layout = pbl.cutting_layout
+        total_used = sum(li.fabric_length_used_cm for li in layout.items)
+        purchase = db.get(MaterialPurchase, layout.material_purchase_id)
         if purchase is not None and purchase.remaining_length_cm is not None:
-            purchase.remaining_length_cm = max(0.0, purchase.remaining_length_cm - length_used)
+            purchase.remaining_length_cm = max(0.0, purchase.remaining_length_cm - total_used)
+        layout.status = "used"
 
     for material_id, qty_used in hardware_qty_by_material.items():
         _fifo_deduct_hardware(db, material_id, qty_used)
@@ -267,4 +344,4 @@ def confirm_batch(batch_id: uuid.UUID, db: Session = Depends(get_db)):
     batch.status = "confirmed"
     batch.confirmed_at = datetime.now(timezone.utc)
     db.commit()
-    return _get_batch_or_404(db, batch_id)
+    return _batch_out(_get_batch_or_404(db, batch_id))

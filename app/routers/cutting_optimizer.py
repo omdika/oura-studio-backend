@@ -9,7 +9,7 @@ from app.models.cutting import CuttingLayout, CuttingLayoutItem
 from app.models.material import MaterialPurchase
 from app.models.pattern import PatternSpec
 from app.models.product import ProductSize
-from app.models.production import ProductionBatch
+from app.models.production import ProductionBatchLayout
 from app.schemas.cutting import (
     CreateLayoutRequest,
     CreateLayoutResponse,
@@ -134,6 +134,9 @@ def create_layout(body: CreateLayoutRequest, db: Session = Depends(get_db)):
         status="suggested",
         waste_pct=body.waste_pct,
         total_fabric_cost=purchase.total_cost,
+        # v2.16: was accepted here but never persisted -- ProductionBatch now denormalizes it
+        # from the first linked layout at batch-creation time.
+        strategy=body.strategy,
     )
     db.add(layout)
     db.flush()
@@ -167,7 +170,10 @@ def discard_layout(layout_id: uuid.UUID, db: Session = Depends(get_db)):
     if layout is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cutting layout not found")
 
-    used = db.query(ProductionBatch.id).filter(ProductionBatch.cutting_layout_id == layout_id).first() is not None
+    used = (
+        db.query(ProductionBatchLayout.id).filter(ProductionBatchLayout.cutting_layout_id == layout_id).first()
+        is not None
+    )
     if layout.status != "suggested" or used:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
