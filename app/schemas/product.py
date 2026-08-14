@@ -51,10 +51,17 @@ class ProductSizeOut(BaseModel):
     manual_stock_qty: int  # sum of stock_ledger.change_qty where reason IN ('initial','adjustment') (added v2.10)
 
 
+class HppLineItemOut(BaseModel):
+    name: str
+    cost: float
+
+
 class HppBreakdownOut(BaseModel):
     fabric: float
+    fabric_items: list[HppLineItemOut] = []  # v3.8: per-fabric-layer breakdown, best-effort
     pooled_material: float
     hardware: float
+    hardware_items: list[HppLineItemOut] = []  # v3.8: per-hardware-component breakdown, best-effort
     labor: float
     overhead: float
     total: float

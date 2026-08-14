@@ -1,0 +1,257 @@
+Eksekusi perubahan backend v3.8: tambah fabric_items + hardware_items ke HppBreakdownOut.
+Baca handoff doc/handoff.md revisi v3.8 untuk konteks bisnis lengkap.
+Berikut spec implementasinya:
+
+---
+
+KONTEKS & MOTIVASI
+
+HPP Breakdown yang dikembalikan ke iOS (latest_hpp_breakdown) saat ini hanya menyimpan
+5 angka agregat: fabric, pooled_material, hardware, labor, overhead.
+
+Untuk produk multi-kain seperti Pouch (Waffle Blue + Linen Putih + Dakron), angka
+"Kain: Rp3.025" tidak menjelaskan kontribusi per kain. User tidak tahu apakah Waffle
+lebih mahal dari Linen, atau berapa Dakron per piece.
+
+Hal yang sama berlaku untuk hardware — satu angka "Hardware: Rp500" tidak menjelaskan
+"Ring D Rp200 + Karet Elastis Rp300".
+
+Solusi v3.8: tambah fabric_items dan hardware_items ke shape HppBreakdownOut.
+Tidak ada schema migration — semua data sudah tersedia di tabel yang ada.
+
+---
+
+1. PYDANTIC SCHEMA
+
+Tambah struct baru HppLineItemOut ke file schema (products.py atau schemas/products.py):
+
+    class HppLineItemOut(BaseModel):
+        name: str
+        cost: float
+
+Update HppBreakdownOut (atau equivalent):
+
+    class HppBreakdownOut(BaseModel):
+        fabric: float
+        fabric_items: list[HppLineItemOut] = []   # NEW — per-kain breakdown
+        pooled_material: float
+        hardware: float
+        hardware_items: list[HppLineItemOut] = []  # NEW — per-hardware breakdown
+        labor: float
+        overhead: float
+        total: float
+
+Default [] memastikan backward compat jika ada consumer lama yang tidak expect field baru.
+
+---
+
+2. LOGIC — fabric_items
+
+Saat ini fungsi _latest_hpp_map (atau equivalent di products.py) sudah mengambil
+production_batch_item terbaru yang confirmed untuk setiap product_size_id.
+
+Untuk mengisi fabric_items, perlu join tambahan dari batch tersebut ke cutting layouts:
+
+Pseudocode:
+
+    def _get_fabric_items(db, batch_id: UUID, product_size_id: UUID) -> list[HppLineItemOut]:
+        # Ambil semua cutting layouts yang linked ke batch ini (via join table)
+        layouts = (
+            db.query(ProductionBatchLayout)
+            .filter(ProductionBatchLayout.production_batch_id == batch_id)
+            .order_by(ProductionBatchLayout.sort_order)
+            .all()
+        )
+
+        items = []
+        for pbl in layouts:
+            layout = pbl.cutting_layout  # eager load atau .get
+
+            # Cari cutting_layout_item untuk product_size_id ini di layout ini
+            cli = (
+                db.query(CuttingLayoutItem)
+                .filter(
+                    CuttingLayoutItem.cutting_layout_id == layout.id,
+                    CuttingLayoutItem.product_size_id == product_size_id,
+                )
+                .first()
+            )
+            if cli is None:
+                continue  # layout ini tidak include size ini
+
+            # Ambil nama kain dari material_purchase → material
+            material_name = layout.material_purchase.material.name
+
+            items.append(HppLineItemOut(name=material_name, cost=cli.cost_per_piece))
+
+        return items
+
+Catatan penting:
+- Gunakan selectinload atau joinedload untuk menghindari N+1 query.
+  Jika sudah ada eager loading di fungsi parent, manfaatkan itu.
+- Jika product_size_id tidak muncul di SEMUA layouts (possible edge case:
+  manual batch atau batch sebelum v2.16), fabric_items boleh kosong —
+  aggregate `fabric` value tetap akurat.
+- cost_per_piece di CuttingLayoutItem adalah COST PER PIECE (sudah dibagi qty),
+  bukan total. Ini yang tepat karena HppBreakdown adalah per-unit cost.
+
+---
+
+3. LOGIC — hardware_items
+
+Hardware cost di HPP BUKAN snapshot historis — hpp_hardware disimpan sebagai satu
+angka agregat, tidak per-komponen. Oleh karena itu hardware_items menggunakan
+CURRENT material avg cost, bukan historical.
+
+Catatan ini harus jelas di komentar code: "cost reflects current avg cost, not
+the cost at time of production — may differ slightly from stored hpp_hardware."
+
+Pseudocode:
+
+    def _get_hardware_items(db, product_size_id: UUID) -> list[HppLineItemOut]:
+        # Cari PatternSpec aktif terbaru untuk product_size_id ini
+        spec = (
+            db.query(PatternSpec)
+            .filter(
+                PatternSpec.product_size_id == product_size_id,
+                PatternSpec.is_active == True,
+            )
+            .order_by(PatternSpec.effective_from.desc())
+            .first()
+        )
+        if spec is None:
+            return []
+
+        items = []
+        for component in spec.components:
+            material = component.material
+            # Hanya hardware yang direct_precise (sama dengan filter di _hardware_cost_per_unit)
+            if material.category != "hardware" or material.cost_class != "direct_precise":
+                continue
+            if material.current_avg_cost is None or material.current_avg_cost == 0:
+                continue
+
+            cost = component.qty_per_unit * material.current_avg_cost
+            items.append(HppLineItemOut(name=material.name, cost=round(cost, 2)))
+
+        return items
+
+---
+
+4. INTEGRASI KE _latest_hpp_map
+
+Fungsi yang mengisi latest_hpp_breakdown perlu diupdate untuk juga memanggil
+dua fungsi di atas dan menyertakan hasilnya di HppBreakdownOut.
+
+Struktur kode saat ini (perkiraan — sesuaikan dengan kode asli):
+
+    # BEFORE
+    breakdown = HppBreakdownOut(
+        fabric=item.hpp_fabric,
+        pooled_material=item.hpp_pooled_material,
+        hardware=item.hpp_hardware,
+        labor=item.hpp_labor,
+        overhead=item.hpp_overhead,
+        total=item.hpp_total,
+    )
+
+    # AFTER
+    breakdown = HppBreakdownOut(
+        fabric=item.hpp_fabric,
+        fabric_items=_get_fabric_items(db, item.production_batch_id, item.product_size_id),
+        pooled_material=item.hpp_pooled_material,
+        hardware=item.hpp_hardware,
+        hardware_items=_get_hardware_items(db, item.product_size_id),
+        labor=item.hpp_labor,
+        overhead=item.hpp_overhead,
+        total=item.hpp_total,
+    )
+
+Perubahan ini berlaku di SEMUA tempat yang memanggil HppBreakdownOut — pastikan
+konsisten antara sizes list dan sizes detail endpoint.
+
+---
+
+5. ENDPOINTS YANG TERPENGARUH
+
+Dua endpoint yang mengembalikan latest_hpp_breakdown:
+
+    GET /products/{sku}/sizes               (list — melalui _latest_hpp_map atau equivalent)
+    GET /products/{sku}/sizes/{size_id}     (detail — melalui per-item HPP lookup)
+
+Pastikan keduanya pakai HppBreakdownOut yang sama. Tidak ada endpoint baru.
+
+---
+
+6. TIDAK ADA SCHEMA MIGRATION
+
+Semua data sudah ada:
+- fabric_items: cutting_layout_item.cost_per_piece + material.name (via purchase → material)
+- hardware_items: pattern_spec_component.qty_per_unit × material.current_avg_cost
+
+Tidak perlu Alembic migration. Tidak perlu kolom baru.
+
+---
+
+7. EDGE CASES
+
+a) Product dengan 1 kain saja (e.g. Scrunchie M Satin):
+   fabric_items akan berisi 1 entry. Frontend menampilkan sub-rows hanya
+   jika count > 1 — jadi satu entry tidak menampilkan sub-rows di UI.
+   Data tetap dikembalikan untuk konsistensi.
+
+b) Product tanpa batch confirmed (stok = 0, belum pernah produksi):
+   latest_hpp_breakdown = null (existing behavior). Tidak berubah.
+   fabric_items dan hardware_items tidak perlu dikembalikan.
+
+c) Manual batch (batch dibuat tanpa cutting layout):
+   production_batch_layout tidak ada entry → _get_fabric_items returns [].
+   fabric_items = []. hardware_items tetap bisa di-derive dari spec.
+
+d) PatternSpec tidak ditemukan untuk hardware_items:
+   Kembalikan [] — jangan raise error. hpp_hardware aggregate tetap akurat
+   karena itu historical snapshot; hardware_items hanya tambahan informasi.
+
+e) material.current_avg_cost = 0 atau None untuk hardware:
+   Skip item tersebut di hardware_items. Jangan return {name: "...", cost: 0}.
+
+---
+
+8. TESTING
+
+Setelah implementasi, verifikasi dengan curl atau test client:
+
+    GET /products/POUWAF/sizes
+
+    Expected (jika ada batch confirmed dengan 2 kain):
+    {
+      "id": "...",
+      "size_label": "Free Size",
+      "latest_hpp_breakdown": {
+        "fabric": 3025.0,
+        "fabric_items": [
+          { "name": "Waffle Blue", "cost": 1500.0 },
+          { "name": "Linen Putih", "cost": 1525.0 }
+        ],
+        "pooled_material": 0.0,
+        "hardware": 0.0,
+        "hardware_items": [],
+        "labor": 11250.0,
+        "overhead": 200.0,
+        "total": 14475.0
+      },
+      ...
+    }
+
+    Verifikasi: SUM(fabric_items[].cost) TIDAK HARUS == fabric (total) karena
+    fabric total sudah include semua layouts; jika ada layout yang item-nya
+    tidak match product_size_id (edge case c), SUM mungkin lebih kecil.
+    Ini acceptable — breakdown adalah best-effort informasi tambahan.
+
+---
+
+9. HANDOFF UPDATE
+
+Setelah implementasi selesai, update baris v3.8 di doc/handoff.md:
+- Ubah "PLANNED" → "IMPLEMENTED"
+- Tambahkan catatan jika ada deviasi dari spec ini

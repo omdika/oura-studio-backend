@@ -1,4 +1,5 @@
 import uuid
+from collections import defaultdict
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from slugify import slugify
@@ -7,10 +8,11 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.deps import get_current_owner
-from app.models.material import MaterialPurchase
-from app.models.pattern import PatternSpec
+from app.models.cutting import CuttingLayout, CuttingLayoutItem
+from app.models.material import Material, MaterialPurchase
+from app.models.pattern import PatternComponent, PatternSpec
 from app.models.product import Product, ProductSize
-from app.models.production import ProductionBatch, ProductionBatchItem
+from app.models.production import ProductionBatch, ProductionBatchItem, ProductionBatchLayout
 from app.models.sales import SalesOrderItem
 from app.models.stock import StockLedger
 from app.schemas.product import (
@@ -18,6 +20,7 @@ from app.schemas.product import (
     AddStockFromBahanResponse,
     DeleteResultOut,
     HppBreakdownOut,
+    HppLineItemOut,
     PriceAdvisorRequest,
     PriceAdvisorResponse,
     ProductCreate,
@@ -155,6 +158,92 @@ def _latest_hpp_map(db: Session, product_size_ids: list[uuid.UUID]) -> dict[uuid
     return latest
 
 
+def _fabric_items_map(
+    db: Session, batch_ids: list[uuid.UUID]
+) -> dict[tuple[uuid.UUID, uuid.UUID], list[HppLineItemOut]]:
+    """v3.8: per-fabric-layer HPP breakdown, keyed by (production_batch_id, product_size_id).
+
+    Deviates from the implement doc's pseudocode (which queries per product_size_id in a loop)
+    -- this codebase's other "latest HPP" lookups (_stock_qty_map, _latest_hpp_map, etc.) are all
+    batched single-query maps for a reason: this backend's DB is cross-region from where it's
+    deployed (~100-150ms per round trip), so an N+1 here would make GET /products/{sku}/sizes
+    scale linearly with size count instead of O(1) extra queries. One query returns every
+    (batch, size) -> fabric layer combination for all requested batches at once.
+
+    cost_per_piece is CuttingLayoutItem's per-piece rate (already divided by qty), matching
+    HppBreakdown's per-unit semantics -- not a total.
+    """
+    if not batch_ids:
+        return {}
+    rows = (
+        db.query(
+            ProductionBatchLayout.production_batch_id,
+            ProductionBatchLayout.sort_order,
+            CuttingLayoutItem.product_size_id,
+            CuttingLayoutItem.cost_per_piece,
+            Material.name,
+        )
+        .join(CuttingLayout, ProductionBatchLayout.cutting_layout_id == CuttingLayout.id)
+        .join(CuttingLayoutItem, CuttingLayoutItem.cutting_layout_id == CuttingLayout.id)
+        .join(MaterialPurchase, CuttingLayout.material_purchase_id == MaterialPurchase.id)
+        .join(Material, MaterialPurchase.material_id == Material.id)
+        .filter(ProductionBatchLayout.production_batch_id.in_(batch_ids))
+        .order_by(ProductionBatchLayout.production_batch_id, ProductionBatchLayout.sort_order)
+        .all()
+    )
+    result: dict[tuple[uuid.UUID, uuid.UUID], list[HppLineItemOut]] = defaultdict(list)
+    for batch_id, _sort_order, size_id, cost_per_piece, material_name in rows:
+        result[(batch_id, size_id)].append(HppLineItemOut(name=material_name, cost=cost_per_piece))
+    return result
+
+
+def _hardware_items_map(db: Session, product_size_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[HppLineItemOut]]:
+    """v3.8: per-hardware-component HPP breakdown, keyed by product_size_id.
+
+    Batched for the same reason as _fabric_items_map (see its docstring) -- two queries total
+    regardless of how many sizes are requested, not two-per-size.
+
+    Uses material.current_avg_cost (CURRENT, not the historical snapshot hpp_hardware was
+    computed from) since PatternComponent doesn't store a per-confirm cost snapshot the way
+    ProductionBatchItem does -- this can drift slightly from the stored hpp_hardware aggregate
+    if avg cost changed since the batch was confirmed. That's expected/documented, not a bug.
+    """
+    if not product_size_ids:
+        return {}
+    specs = (
+        db.query(PatternSpec)
+        .filter(PatternSpec.product_size_id.in_(product_size_ids), PatternSpec.is_active.is_(True))
+        .order_by(PatternSpec.product_size_id, PatternSpec.effective_from.desc())
+        .all()
+    )
+    # Post-v2.15 there should be at most one active spec per size, but be defensive and take the
+    # most recently effective one per size in case that invariant is ever violated.
+    latest_spec_by_size: dict[uuid.UUID, PatternSpec] = {}
+    for spec in specs:
+        latest_spec_by_size.setdefault(spec.product_size_id, spec)
+    if not latest_spec_by_size:
+        return {}
+
+    spec_ids = [spec.id for spec in latest_spec_by_size.values()]
+    rows = (
+        db.query(PatternComponent.pattern_spec_id, PatternComponent.qty_per_unit, Material.name, Material.current_avg_cost)
+        .join(Material, PatternComponent.material_id == Material.id)
+        .filter(
+            PatternComponent.pattern_spec_id.in_(spec_ids),
+            Material.category == "hardware",
+            Material.cost_class == "direct_precise",
+        )
+        .all()
+    )
+    items_by_spec: dict[uuid.UUID, list[HppLineItemOut]] = defaultdict(list)
+    for spec_id, qty_per_unit, material_name, avg_cost in rows:
+        if not avg_cost:
+            continue
+        items_by_spec[spec_id].append(HppLineItemOut(name=material_name, cost=round(qty_per_unit * avg_cost, 2)))
+
+    return {size_id: items_by_spec.get(spec.id, []) for size_id, spec in latest_spec_by_size.items()}
+
+
 def _product_size_has_history(db: Session, product_size_id: uuid.UUID) -> bool:
     has_pattern_spec = (
         db.query(PatternSpec.id).filter(PatternSpec.product_size_id == product_size_id).first() is not None
@@ -190,13 +279,19 @@ def _size_out(size: ProductSize, stock_qty: int, production_qty: int, manual_qty
     )
 
 
-def _hpp_breakdown_out(latest_item: ProductionBatchItem | None) -> HppBreakdownOut | None:
+def _hpp_breakdown_out(
+    latest_item: ProductionBatchItem | None,
+    fabric_items: list[HppLineItemOut],
+    hardware_items: list[HppLineItemOut],
+) -> HppBreakdownOut | None:
     if latest_item is None:
         return None
     return HppBreakdownOut(
         fabric=latest_item.hpp_fabric,
+        fabric_items=fabric_items,
         pooled_material=latest_item.hpp_pooled_material,
         hardware=latest_item.hpp_hardware,
+        hardware_items=hardware_items,
         labor=latest_item.hpp_labor,
         overhead=latest_item.hpp_overhead,
         total=latest_item.hpp_total,
@@ -209,6 +304,8 @@ def _detail_out(
     production_qty: int,
     manual_qty: int,
     latest_item: ProductionBatchItem | None,
+    fabric_items: list[HppLineItemOut],
+    hardware_items: list[HppLineItemOut],
 ) -> ProductSizeDetailOut:
     margin_pct = (
         compute_margin_pct(size.selling_price, latest_item.hpp_total)
@@ -220,7 +317,7 @@ def _detail_out(
         current_stock_qty=stock_qty,
         production_stock_qty=production_qty,
         manual_stock_qty=manual_qty,
-        latest_hpp_breakdown=_hpp_breakdown_out(latest_item),
+        latest_hpp_breakdown=_hpp_breakdown_out(latest_item, fabric_items, hardware_items),
         margin_pct=margin_pct,
     )
 
@@ -229,7 +326,14 @@ def _size_detail_out(db: Session, size: ProductSize) -> ProductSizeDetailOut:
     stock_qty = _current_stock_qty(db, size.id)
     production_qty, manual_qty = _stock_breakdown(db, size.id)
     latest_item = _latest_production_item(db, size.id)
-    return _detail_out(size, stock_qty, production_qty, manual_qty, latest_item)
+    fabric_items: list[HppLineItemOut] = []
+    hardware_items: list[HppLineItemOut] = []
+    if latest_item is not None:
+        fabric_items = _fabric_items_map(db, [latest_item.production_batch_id]).get(
+            (latest_item.production_batch_id, size.id), []
+        )
+        hardware_items = _hardware_items_map(db, [size.id]).get(size.id, [])
+    return _detail_out(size, stock_qty, production_qty, manual_qty, latest_item, fabric_items, hardware_items)
 
 
 @router.post("/products", response_model=ProductOut, status_code=status.HTTP_201_CREATED)
@@ -351,12 +455,17 @@ def list_product_sizes(
     stock_map = _stock_qty_map(db, size_ids)
     breakdown_map = _stock_breakdown_map(db, size_ids)
     hpp_map = _latest_hpp_map(db, size_ids)
+    batch_ids = [item.production_batch_id for item in hpp_map.values()]
+    fabric_map = _fabric_items_map(db, batch_ids)
+    hardware_map = _hardware_items_map(db, size_ids)
     out = [
         _detail_out(
             s,
             stock_map.get(s.id, 0),
             *breakdown_map.get(s.id, (0, 0)),
             hpp_map.get(s.id),
+            fabric_map.get((hpp_map[s.id].production_batch_id, s.id), []) if s.id in hpp_map else [],
+            hardware_map.get(s.id, []),
         )
         for s in sizes
     ]
