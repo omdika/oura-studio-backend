@@ -1,0 +1,173 @@
+Eksekusi perubahan backend v3.9: cleanup benang dari PatternComponent + verifikasi pooled_material_rate.
+Baca handoff doc/handoff.md revisi v3.9 untuk konteks bisnis lengkap.
+
+---
+
+KONTEKS & MOTIVASI
+
+Benang (thread) ditetapkan sebagai Model A (pooled flat rate):
+- HPP benang masuk ke `hpp_pooled_material` via setting `pooled_material_rate:benang`
+- Benang TIDAK boleh ada sebagai PatternComponent karena akan double-count
+
+Masalah yang teridentifikasi di data live:
+1. Beberapa material benang masuk ke resep (PatternSpec) sebagai komponen dengan
+   `usage_unit = "cm2"` — unit salah, dan keberadaannya di resep menyebabkan
+   double-count antara `hpp_hardware` dan `hpp_pooled_material`
+2. `pooled_material_rate:benang` mungkin belum diset di tabel settings
+3. `material.usage_unit` untuk benang mungkin "cm2" — perlu dikoreksi
+
+Tidak ada schema migration yang diperlukan.
+
+---
+
+PENTING: CEK DULU DATA AKTUAL
+
+Sebelum hapus apapun, jalankan query diagnostik ini dan catat hasilnya:
+
+1. Cek material benang yang ada:
+
+    SELECT id, name, category, cost_class, usage_unit, current_avg_cost
+    FROM material
+    WHERE category = 'thread'
+    ORDER BY name;
+
+2. Cek apakah benang masuk sebagai PatternComponent:
+
+    SELECT
+        pc.id AS component_id,
+        m.name AS material_name,
+        m.usage_unit,
+        pc.qty_per_unit,
+        ps.id AS pattern_spec_id,
+        ps.product_size_id
+    FROM pattern_component pc
+    JOIN material m ON m.id = pc.material_id
+    JOIN pattern_spec ps ON ps.id = pc.pattern_spec_id
+    WHERE m.category = 'thread'
+    ORDER BY m.name;
+
+3. Cek nilai pooled_material_rate yang ada di settings:
+
+    SELECT key, value
+    FROM settings
+    WHERE key LIKE 'pooled_material_rate%'
+    ORDER BY key;
+
+Catat output semuanya sebelum lanjut.
+
+---
+
+LANGKAH 1: HAPUS BENANG DARI PATTERN_COMPONENT
+
+Jika query #2 di atas menghasilkan baris (ada benang sebagai komponen resep):
+
+    -- DRY RUN dulu: lihat apa yang akan dihapus
+    SELECT
+        pc.id,
+        m.name,
+        ps.product_size_id
+    FROM pattern_component pc
+    JOIN material m ON m.id = pc.material_id
+    JOIN pattern_spec ps ON ps.id = pc.pattern_spec_id
+    WHERE m.category = 'thread';
+
+    -- Jika hasilnya benar, jalankan delete:
+    DELETE FROM pattern_component
+    WHERE id IN (
+        SELECT pc.id
+        FROM pattern_component pc
+        JOIN material m ON m.id = pc.material_id
+        WHERE m.category = 'thread'
+    );
+
+Catatan: ini tidak mengubah hpp_hardware untuk batch yang sudah confirmed —
+data HPP yang sudah terkunci di production_batch_item tidak berubah.
+Efeknya hanya ke HPP untuk batch BARU yang akan dibuat setelah ini.
+
+---
+
+LANGKAH 2: FIX usage_unit MATERIAL BENANG
+
+Jika query #1 menunjukkan usage_unit = 'cm2' untuk material benang:
+
+    -- DRY RUN: lihat yang akan diupdate
+    SELECT id, name, usage_unit
+    FROM material
+    WHERE category = 'thread' AND usage_unit = 'cm2';
+
+    -- Update ke 'pcs' (benang dihitung per gulung/spool, bukan per cm)
+    UPDATE material
+    SET usage_unit = 'pcs', updated_at = now()
+    WHERE category = 'thread' AND usage_unit = 'cm2';
+
+Catatan: usage_unit 'pcs' lebih tepat untuk benang yang dibeli per gulung.
+Ini tidak mempengaruhi HPP calculation (benang sudah tidak di resep setelah
+Langkah 1), tapi membersihkan data untuk konsistensi.
+
+---
+
+LANGKAH 3: VERIFIKASI pooled_material_rate:benang DI SETTINGS
+
+Cek apakah key sudah ada:
+
+    SELECT key, value FROM settings WHERE key = 'pooled_material_rate:thread';
+
+Kemungkinan hasilnya:
+a) Tidak ada baris → perlu INSERT dengan nilai estimasi owner
+b) Ada baris dengan value = 0 → perlu UPDATE dengan nilai yang benar
+c) Ada baris dengan value > 0 → sudah oke, catat nilainya saja
+
+Untuk INSERT jika belum ada (nilai placeholder — owner harus konfirmasi nilai sebenarnya):
+
+    -- Ganti 500 dengan estimasi owner: berapa Rp biaya benang per produk jadi
+    INSERT INTO settings (key, value)
+    VALUES ('pooled_material_rate:thread', '500')
+    ON CONFLICT (key) DO NOTHING;
+
+Nilai ini adalah Rp per pcs produk jadi. Owner bisa update via SettingsView di app.
+
+---
+
+LANGKAH 4: VERIFIKASI AKHIR
+
+Setelah semua langkah selesai, jalankan ulang query diagnostik:
+
+    -- Pastikan tidak ada lagi benang di pattern_component
+    SELECT COUNT(*) FROM pattern_component pc
+    JOIN material m ON m.id = pc.material_id
+    WHERE m.category = 'thread';
+    -- Expected: 0
+
+    -- Pastikan usage_unit sudah bersih
+    SELECT name, usage_unit FROM material WHERE category = 'thread';
+    -- Expected: semua 'pcs' atau 'roll', tidak ada 'cm2'
+
+    -- Cek pooled rate ada
+    SELECT key, value FROM settings WHERE key LIKE 'pooled_material_rate%';
+    -- Expected: ada baris 'pooled_material_rate:thread' dengan value > 0
+
+---
+
+EDGE CASES
+
+- Jika ada PatternComponent benang yang terhubung ke batch sudah confirmed:
+  penghapusan component TETAP aman — data HPP di production_batch_item sudah
+  terkunci (column hpp_hardware di batch item tidak berubah). Hanya future
+  batches yang terpengaruh.
+
+- Jika ada lebih dari satu nama key untuk benang (misal 'pooled_material_rate:benang'
+  vs 'pooled_material_rate:thread'), keep keduanya atau harmonisasi ke satu key
+  — cek dulu dengan: SELECT key FROM settings WHERE key LIKE '%benang%' OR key LIKE '%thread%';
+
+- Jika `cost_class` benang adalah 'direct_precise' (bukan 'direct_pooled'):
+  update juga: UPDATE material SET cost_class = 'direct_pooled' WHERE category = 'thread';
+  Ini penting karena cost_class mempengaruhi filter di _hardware_cost_per_unit().
+
+---
+
+HANDOFF UPDATE
+
+Setelah selesai, update baris v3.9 di doc/handoff.md:
+- Ubah status menjadi "IMPLEMENTED"
+- Catat: berapa PatternComponent benang yang dihapus, usage_unit sebelum/sesudah,
+  nilai pooled_material_rate:thread yang di-set
