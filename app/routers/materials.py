@@ -7,7 +7,10 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.deps import get_current_owner
+from app.models.cutting import CuttingLayout, CuttingLayoutItem
 from app.models.material import Material, MaterialPurchase, Supplier
+from app.models.product import Product, ProductSize
+from app.models.production import ProductionBatch, ProductionBatchLayout
 from app.schemas.material import (
     MaterialCreate,
     MaterialOut,
@@ -15,6 +18,7 @@ from app.schemas.material import (
     MaterialPurchaseOut,
     MaterialPurchaseUpdate,
     MaterialUpdate,
+    MaterialUsageEntryOut,
 )
 from app.services.material_cost import (
     compute_weighted_avg_cost,
@@ -91,6 +95,75 @@ def _get_material_or_404(db: Session, material_id: uuid.UUID) -> Material:
     if material is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Material not found")
     return material
+
+
+def _fabric_usage_entries(
+    db: Session,
+    material_id: uuid.UUID,
+    from_date: date | None,
+    to_date: date | None,
+    limit: int,
+) -> list[MaterialUsageEntryOut]:
+    """v3.13: derives fabric consumption history from cutting_layout_item rows whose layout has
+    been consumed by a confirmed ProductionBatch. There is no dedicated usage-log table -- this
+    is a read-only projection over existing data (see handoff v3.13 for why hardware/thread has
+    no equivalent: _fifo_deduct_hardware() only mutates remaining_* in place, it doesn't log).
+    """
+    query = (
+        db.query(
+            CuttingLayoutItem.id,
+            CuttingLayoutItem.fabric_length_used_cm,
+            func.date(ProductionBatch.confirmed_at).label("date"),
+            ProductSize.size_label,
+            ProductSize.fabric_variant_name,
+            ProductSize.id.label("product_size_id"),
+            Product.sku.label("product_sku"),
+        )
+        .join(CuttingLayout, CuttingLayout.id == CuttingLayoutItem.cutting_layout_id)
+        .join(MaterialPurchase, MaterialPurchase.id == CuttingLayout.material_purchase_id)
+        .join(ProductionBatchLayout, ProductionBatchLayout.cutting_layout_id == CuttingLayout.id)
+        .join(ProductionBatch, ProductionBatch.id == ProductionBatchLayout.production_batch_id)
+        .join(ProductSize, ProductSize.id == CuttingLayoutItem.product_size_id)
+        .join(Product, Product.id == ProductSize.product_id)
+        .filter(
+            MaterialPurchase.material_id == material_id,
+            CuttingLayout.status == "used",
+            ProductionBatch.status == "confirmed",
+            # confirmed_at is nullable for batches confirmed before the v2.12 migration added the
+            # column -- skip those rather than crash or silently mis-date them (implement doc's
+            # recommended option 1; batch volume from that era is small).
+            ProductionBatch.confirmed_at.isnot(None),
+        )
+        .order_by(ProductionBatch.confirmed_at.desc())
+    )
+
+    if from_date:
+        query = query.filter(func.date(ProductionBatch.confirmed_at) >= from_date)
+    if to_date:
+        query = query.filter(func.date(ProductionBatch.confirmed_at) <= to_date)
+
+    query = query.limit(limit)
+
+    results = []
+    for row in query.all():
+        parts = [row.size_label]
+        if row.fabric_variant_name:
+            parts.append(row.fabric_variant_name)
+        description = " · ".join(parts)
+
+        results.append(
+            MaterialUsageEntryOut(
+                id=row.id,
+                material_id=material_id,
+                deducted_cm=row.fabric_length_used_cm or 0.0,
+                date=row.date,
+                description=description,
+                product_size_id=row.product_size_id,
+                product_sku=row.product_sku,
+                size_label=row.size_label,
+            )
+        )
+    return results
 
 
 @router.post("", response_model=MaterialOut, status_code=status.HTTP_201_CREATED)
@@ -210,6 +283,22 @@ def create_purchase(material_id: uuid.UUID, body: MaterialPurchaseCreate, db: Se
     db.commit()
     db.refresh(purchase)
     return _purchase_out(material, purchase)
+
+
+@router.get("/{material_id}/usage", response_model=list[MaterialUsageEntryOut])
+def get_material_usage(
+    material_id: uuid.UUID,
+    from_date: date | None = Query(default=None, alias="from"),
+    to_date: date | None = Query(default=None, alias="to"),
+    limit: int = Query(default=50, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    material = _get_material_or_404(db, material_id)
+    # Hardware/thread consumption isn't logged anywhere (_fifo_deduct_hardware in production.py
+    # only mutates remaining_* in place) -- only fabric has a derivable usage history.
+    if material.category != "fabric":
+        return []
+    return _fabric_usage_entries(db, material_id, from_date, to_date, limit)
 
 
 @router.get("/{material_id}/purchases", response_model=list[MaterialPurchaseOut])

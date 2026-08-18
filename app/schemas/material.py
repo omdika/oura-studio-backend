@@ -105,3 +105,14 @@ class MaterialPurchaseOut(BaseModel):
     remaining_qty: float | None
     created_at: datetime
     is_consumed: bool
+
+
+class MaterialUsageEntryOut(BaseModel):
+    id: uuid.UUID
+    material_id: uuid.UUID
+    deducted_cm: float
+    date: date
+    description: str
+    product_size_id: uuid.UUID | None = None
+    product_sku: str | None = None
+    size_label: str | None = None

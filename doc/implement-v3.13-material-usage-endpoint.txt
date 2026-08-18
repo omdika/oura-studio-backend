@@ -1,0 +1,237 @@
+Eksekusi perubahan backend v3.13: tambah GET /materials/{id}/usage — riwayat pemakaian kain.
+Baca handoff doc/handoff.md revisi v3.13 dan doc/versions/v3.13.md untuk konteks bisnis lengkap.
+Berikut spec implementasinya:
+
+---
+
+KONTEKS & MOTIVASI
+
+Tab "Bahan" di iOS menampilkan detail per material, termasuk section "Pergerakan Stok" yang
+menggabungkan pembelian (MaterialPurchase) dan pemakaian (MaterialUsageEntry).
+
+Pembelian sudah tampil dari GET /materials/{id}/purchases.
+Pemakaian selalu kosong karena iOS saat ini hardcode return [] — endpoint belum ada.
+
+Investigation 2026-08-17 menyimpulkan:
+- Pemakaian KAIN bisa diderivasi dari cutting_layout + cutting_layout_item (status='used')
+  yang terhubung ke confirmed production_batch via production_batch_layout join table.
+- Pemakaian HARDWARE & BENANG: _fifo_deduct_hardware() tidak menulis log historis.
+  Tidak ada data yang bisa diderivasi. Return [] untuk kategori ini sampai ada logging table.
+
+Endpoint ini murni read-only — tidak ada schema migration.
+
+---
+
+PENTING: CEK DULU STRUKTUR KODE AKTUAL
+
+Sebelum implementasi, baca kode aktual untuk menemukan:
+1. File router untuk materials (kemungkinan materials.py atau resources/material.py)
+2. Cara query material by id yang sudah ada (fungsi helper atau dependency injection)
+3. Pattern query yang sudah ada untuk cutting_layout / cutting_layout_item (lihat production.py)
+4. Pola naming Pydantic schema yang dipakai (e.g. MaterialOut, MaterialPurchaseOut)
+
+Jangan asumsikan nama fungsi atau path file — baca dulu.
+
+---
+
+1. PYDANTIC SCHEMA
+
+Tambah schema baru (di file schema yang relevan, misalnya schemas/material.py):
+
+    class MaterialUsageEntryOut(BaseModel):
+        id: UUID
+        material_id: UUID
+        deducted_cm: float
+        date: date            # Python date object, serialized ke "yyyy-MM-dd"
+        description: str
+        product_size_id: UUID | None = None
+        product_sku: str | None = None
+        size_label: str | None = None
+
+        model_config = ConfigDict(from_attributes=True)
+
+Catatan: gunakan `date` dari Python stdlib (bukan `datetime`) agar serialisasi ke "2026-08-14"
+tidak menyertakan komponen waktu — backend lain sudah pernah ditolak iOS karena format ISO8601
+penuh ("Datetimes provided to dates should have zero time").
+
+---
+
+2. ROUTER ENDPOINT
+
+Tambah endpoint baru ke router materials:
+
+    @router.get("/{material_id}/usage", response_model=list[MaterialUsageEntryOut])
+    def get_material_usage(
+        material_id: UUID,
+        from_date: date | None = Query(None, alias="from"),
+        to_date: date | None = Query(None, alias="to"),
+        limit: int = Query(50, ge=1, le=500),
+        db: Session = Depends(get_db),
+        _: dict = Depends(require_auth),
+    ):
+        material = db.get(Material, material_id)
+        if material is None:
+            raise HTTPException(status_code=404, detail="Material not found")
+
+        # Hardware & thread tidak punya log historis — return kosong
+        if material.category != "fabric":
+            return []
+
+        return _fabric_usage_entries(db, material_id, from_date, to_date, limit)
+
+---
+
+3. LOGIC — _fabric_usage_entries
+
+Derive pemakaian dari cutting_layout_item yang sudah digunakan di confirmed batch:
+
+    def _fabric_usage_entries(
+        db: Session,
+        material_id: UUID,
+        from_date: date | None,
+        to_date: date | None,
+        limit: int,
+    ) -> list[MaterialUsageEntryOut]:
+        query = (
+            db.query(
+                CuttingLayoutItem.id.label("id"),
+                MaterialPurchase.material_id.label("material_id"),
+                CuttingLayoutItem.fabric_length_used_cm.label("deducted_cm"),
+                func.date(ProductionBatch.confirmed_at).label("date"),
+                ProductSize.size_label.label("size_label"),
+                ProductSize.fabric_variant_name.label("fabric_variant_name"),
+                ProductSize.id.label("product_size_id"),
+                Product.sku.label("product_sku"),
+            )
+            .join(CuttingLayout, CuttingLayout.id == CuttingLayoutItem.cutting_layout_id)
+            .join(MaterialPurchase, MaterialPurchase.id == CuttingLayout.material_purchase_id)
+            .join(ProductionBatchLayout, ProductionBatchLayout.cutting_layout_id == CuttingLayout.id)
+            .join(ProductionBatch, ProductionBatch.id == ProductionBatchLayout.production_batch_id)
+            .join(ProductSize, ProductSize.id == CuttingLayoutItem.product_size_id)
+            .join(Product, Product.id == ProductSize.product_id)
+            .filter(
+                MaterialPurchase.material_id == material_id,
+                CuttingLayout.status == "used",
+                ProductionBatch.status == "confirmed",
+            )
+            .order_by(ProductionBatch.confirmed_at.desc().nullslast())
+            .limit(limit)
+        )
+
+        if from_date:
+            query = query.filter(func.date(ProductionBatch.confirmed_at) >= from_date)
+        if to_date:
+            query = query.filter(func.date(ProductionBatch.confirmed_at) <= to_date)
+
+        rows = query.all()
+        results = []
+        for row in rows:
+            # Build description: "M · Satin Pelangi" atau hanya "M" jika fabric_variant_name null
+            parts = [row.size_label]
+            if row.fabric_variant_name:
+                parts.append(row.fabric_variant_name)
+            description = " · ".join(parts)
+
+            results.append(MaterialUsageEntryOut(
+                id=row.id,
+                material_id=row.material_id,
+                deducted_cm=row.deducted_cm or 0.0,
+                date=row.date,
+                description=description,
+                product_size_id=row.product_size_id,
+                product_sku=row.product_sku,
+                size_label=row.size_label,
+            ))
+        return results
+
+Catatan penting tentang model imports:
+- Pastikan semua model diimport: CuttingLayoutItem, CuttingLayout, MaterialPurchase,
+  ProductionBatchLayout, ProductionBatch, ProductSize, Product
+- production_batch_layout sudah ada sejak v2.16 — pakai model SQLAlchemy yang sudah ada
+  (jangan buat baru)
+- func, Query diimport dari sqlalchemy
+
+---
+
+4. EDGE CASES
+
+- Material bukan fabric (hardware, thread): return [] tanpa query — sudah di-handle di router
+- Material valid tapi belum pernah dipakai: query return [], bukan 404
+- cutting_layout masih 'suggested' (belum dipakai): dikecualikan filter `status == 'used'`
+- production_batch masih 'draft': dikecualikan filter `status == 'confirmed'`
+- confirmed_at null (batch lama sebelum v2.12 migration):
+  `nullslast()` di ORDER BY menghindari crash; date menjadi null
+  → opsi 1: skip row (filter `ProductionBatch.confirmed_at != None`)
+  → opsi 2: fallback ke `produced_at` (lebih lengkap tapi lebih kompleks)
+  Rekomendasi: opsi 1 (skip) — lebih aman, dan batch lama jumlahnya sedikit
+- product_size.fabric_variant_name null: description hanya size_label (sudah di-handle di-code)
+- deducted_cm null: fallback ke 0.0 (sudah di-handle di-code)
+
+---
+
+5. TIDAK ADA SCHEMA MIGRATION
+
+Endpoint ini hanya membaca data yang sudah ada:
+- cutting_layout_item.fabric_length_used_cm — sudah ada sejak awal
+- cutting_layout.status — sudah ada, diset 'used' saat batch dikonfirmasi
+- production_batch_layout — join table yang ditambahkan v2.16
+- production_batch.confirmed_at — kolom ditambahkan v2.12
+
+Tidak ada CREATE TABLE, ALTER TABLE, atau alembic revision yang diperlukan.
+
+---
+
+6. VERIFIKASI
+
+Setelah implementasi, test dengan material yang sudah punya confirmed production batch:
+
+    curl https://<backend-url>/api/v1/materials/<fabric-material-id>/usage \
+      -H "Authorization: Bearer <token>"
+
+Expected response (jika ada confirmed batch dengan kain ini):
+    [
+      {
+        "id": "uuid",
+        "material_id": "uuid",
+        "deducted_cm": 150.0,
+        "date": "2026-08-14",
+        "description": "M · Satin Pelangi",
+        "product_size_id": "uuid",
+        "product_sku": "SCRSAT",
+        "size_label": "M"
+      }
+    ]
+
+Test edge cases:
+1. Material dengan category='hardware' → response []
+2. Material fabric yang belum pernah dipakai → response []
+3. Filter from/to: pastikan hanya entri dalam range yang dikembalikan
+4. Material ID tidak ada → 404
+
+---
+
+7. FRONTEND — YANG PERLU DIUBAH SETELAH BACKEND LIVE
+
+(Terpisah dari task ini — untuk dieksekusi setelah endpoint verified)
+
+File: oura studio frontend/Networking/Models/MaterialModels.swift
+- Tambah `Codable` conformance ke `MaterialUsageEntry`
+- Tambah CodingKeys jika field name berbeda dari snake_case default
+
+File: oura studio frontend/Networking/APIService.swift
+- Ganti `return []` dengan real API call:
+  ```swift
+  func getMaterialUsage(materialId: UUID) async throws -> [MaterialUsageEntry] {
+      let data = try await get("/materials/\(materialId)/usage")
+      return try decoder.decode([MaterialUsageEntry].self, from: data)
+  }
+  ```
+- Verifikasi `BahanDetailView.stockMovements` sudah merge purchases + usageEntries
+
+---
+
+8. HANDOFF UPDATE
+
+Setelah selesai, update baris v3.13 di doc/handoff.md:
+- Ubah "PLANNED" → "IMPLEMENTED"
+- Tambahkan catatan jika ada deviasi dari spec ini (terutama soal null confirmed_at handling)
