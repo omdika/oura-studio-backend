@@ -18,6 +18,11 @@ class Material(Base):
     purchase_unit: Mapped[str] = mapped_column(String, nullable=False)  # meter | roll | pack | pcs
     usage_unit: Mapped[str] = mapped_column(String, nullable=False)  # cm | cm2 | pcs
     fabric_width_cm: Mapped[float | None] = mapped_column(Numeric(asdecimal=False), nullable=True)
+    # v3.15: groups color/pattern variants of the same fabric type (e.g. "Satin Pink"/"Satin Merah"
+    # both -> fabric_family "Satin") so iOS can input cut dimensions once per family instead of
+    # once per material. Purely a client-side grouping aid -- backend doesn't use this for costing
+    # or PatternSpec logic.
+    fabric_family: Mapped[str | None] = mapped_column(String(100), nullable=True)
     current_avg_cost: Mapped[float] = mapped_column(Numeric(asdecimal=False), nullable=False, default=0)
     reorder_min_qty: Mapped[float | None] = mapped_column(Numeric(asdecimal=False), nullable=True)
     is_archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

@@ -13,12 +13,14 @@ class MaterialCreate(BaseModel):
     purchase_unit: str
     usage_unit: str
     fabric_width_cm: float | None = None
+    fabric_family: str | None = None
     reorder_min_qty: float | None = None
 
 
 class MaterialUpdate(BaseModel):
     name: str | None = None
     fabric_width_cm: float | None = None
+    fabric_family: str | None = None
     reorder_min_qty: float | None = None
     is_archived: bool | None = None
 
@@ -33,6 +35,7 @@ class MaterialOut(BaseModel):
     purchase_unit: str
     usage_unit: str
     fabric_width_cm: float | None
+    fabric_family: str | None
     current_avg_cost: float
     reorder_min_qty: float | None
     is_archived: bool

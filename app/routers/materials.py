@@ -166,6 +166,10 @@ def _fabric_usage_entries(
     return results
 
 
+def _normalize_fabric_family(value: str | None) -> str | None:
+    return value.strip() or None if value is not None else None
+
+
 @router.post("", response_model=MaterialOut, status_code=status.HTTP_201_CREATED)
 def create_material(body: MaterialCreate, db: Session = Depends(get_db)):
     if body.category != "fabric" and body.fabric_width_cm is not None:
@@ -178,6 +182,7 @@ def create_material(body: MaterialCreate, db: Session = Depends(get_db)):
         purchase_unit=body.purchase_unit,
         usage_unit=body.usage_unit,
         fabric_width_cm=body.fabric_width_cm,
+        fabric_family=_normalize_fabric_family(body.fabric_family),
         reorder_min_qty=body.reorder_min_qty,
     )
     db.add(material)
@@ -202,6 +207,24 @@ def list_materials(
     return q.order_by(Material.name).offset(offset).limit(limit).all()
 
 
+@router.get("/families", response_model=list[str])
+def get_fabric_families(db: Session = Depends(get_db)):
+    """v3.15: distinct non-null fabric_family values, sorted A-Z, archived materials excluded.
+
+    Registered before /{material_id} -- FastAPI matches routes top-to-bottom, and a literal
+    "families" path segment would otherwise be swallowed by the {material_id}: UUID converter
+    and 422 instead of hitting this handler.
+    """
+    rows = (
+        db.query(Material.fabric_family)
+        .filter(Material.fabric_family.is_not(None), Material.is_archived.is_(False))
+        .distinct()
+        .order_by(Material.fabric_family)
+        .all()
+    )
+    return [row[0] for row in rows]
+
+
 @router.get("/{material_id}", response_model=MaterialOut)
 def get_material(material_id: uuid.UUID, db: Session = Depends(get_db)):
     return _get_material_or_404(db, material_id)
@@ -217,6 +240,11 @@ def update_material(material_id: uuid.UUID, body: MaterialUpdate, db: Session = 
         if material.category != "fabric":
             raise HTTPException(status_code=400, detail="fabric_width_cm only applies to category='fabric'")
         material.fabric_width_cm = body.fabric_width_cm
+    # fabric_family uses model_fields_set (not "is not None") because null is a meaningful,
+    # distinct value here -- {"fabric_family": null} must clear it, unlike every other field on
+    # this endpoint where None only ever meant "omitted". See v3.15 edge case (e).
+    if "fabric_family" in body.model_fields_set:
+        material.fabric_family = _normalize_fabric_family(body.fabric_family)
     if body.reorder_min_qty is not None:
         material.reorder_min_qty = body.reorder_min_qty
     if body.is_archived is not None:

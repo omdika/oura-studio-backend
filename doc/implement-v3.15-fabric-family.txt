@@ -1,0 +1,238 @@
+Eksekusi perubahan backend v3.15: tambah kolom fabric_family ke material + endpoint GET /materials/families.
+Baca doc/handoff.md revisi v3.15 dan doc/versions/v3.15.md untuk konteks bisnis lengkap.
+Berikut spec implementasinya:
+
+---
+
+KONTEKS & MOTIVASI
+
+User memiliki puluhan material kain dengan nama per warna (Satin Pink, Satin Merah, Satin Hijau,
+Waffle Kuning, Waffle Biru, dst). Di form resep iOS, user harus mengisi dimensi potongan (panjang
+× lebar) untuk setiap material secara terpisah — meskipun semua varian satu jenis biasanya punya
+dimensi identik per ukuran produk.
+
+Contoh: Satin Pink XS = 90×6 cm, Satin Merah XS = 90×6 cm, Satin Hijau XS = 90×6 cm.
+Dengan 10 warna satin dan 6 ukuran, itu 60 input yang seharusnya cukup 6 (satu per jenis per ukuran).
+
+Solusi: tambah `fabric_family` (nullable string) ke tabel material, sehingga iOS bisa kelompokkan
+kain berdasarkan jenis, input dimensi sekali per family, lalu expand ke individual material_id
+sebelum kirim ke PatternSpec endpoint.
+
+Endpoint GET /materials/families diperlukan untuk autocomplete saat user mengisi atau mengedit
+fabric_family di screen detail bahan.
+
+Tidak ada perubahan ke PatternSpec endpoint — expansion terjadi di iOS, bukan backend.
+
+---
+
+PENTING: CEK DULU STRUKTUR KODE AKTUAL
+
+Sebelum implementasi, baca kode aktual untuk menemukan:
+1. File router untuk materials (kemungkinan routers/materials.py)
+2. File schema untuk material (kemungkinan schemas/material.py) — cari class MaterialOut,
+   CreateMaterialRequest, PatchMaterialRequest yang sudah ada
+3. Model SQLAlchemy untuk Material (kemungkinan models/material.py) — cari kolom yang sudah ada
+4. Cara PATCH material yang sudah ada — pastikan pakai exclude_unset=True agar null vs absent bisa dibedakan
+5. Pattern auth yang dipakai — apakah per-endpoint Depends(require_auth) atau per-router Depends(get_current_owner)
+6. File alembic yang paling baru (alembic/versions/) untuk naming convention revision id
+
+Jangan asumsikan nama class, nama file, atau nama dependency — baca dulu.
+
+---
+
+1. MIGRATION ALEMBIC
+
+Buat revision baru:
+
+    alembic revision --autogenerate -m "add_fabric_family_to_material"
+
+Jika autogenerate tidak mendeteksi perubahan (karena model belum diupdate), buat manual:
+
+    def upgrade():
+        op.add_column(
+            "material",
+            sa.Column("fabric_family", sa.String(100), nullable=True)
+        )
+        # Optional index untuk query GET /materials/families yang filter + distinct
+        op.create_index(
+            "ix_material_fabric_family",
+            "material",
+            ["fabric_family"],
+            postgresql_where=sa.text("fabric_family IS NOT NULL"),
+        )
+
+    def downgrade():
+        op.drop_index("ix_material_fabric_family", table_name="material")
+        op.drop_column("material", "fabric_family")
+
+Kolom nullable — tidak perlu server_default, tidak ada data migration.
+
+CATATAN DEPLOYMENT: ALTER TABLE ADD COLUMN nullable di PostgreSQL = lock singkat (~millisecond).
+Aman dijalankan saat server live. Tidak perlu maintenance window.
+
+---
+
+2. SQLALCHEMY MODEL
+
+Di file model Material, tambah kolom baru:
+
+    fabric_family: Mapped[str | None] = mapped_column(
+        String(100), nullable=True, default=None
+    )
+
+Jika model masih pakai style lama (Column declarative tanpa Mapped):
+
+    fabric_family = Column(String(100), nullable=True)
+
+Tempatkan di antara kolom yang relevan secara semantis (misalnya setelah fabric_width_cm).
+
+---
+
+3. PYDANTIC SCHEMA
+
+Di file schema material, tambah field fabric_family ke tiga class:
+
+a) MaterialBase atau MaterialOut (response):
+
+    fabric_family: str | None = None
+
+b) CreateMaterialRequest (POST body):
+
+    fabric_family: str | None = None
+
+c) PatchMaterialRequest (PATCH body):
+
+    fabric_family: str | None = None
+
+Tambahkan field ini ke SEMUA tiga class agar konsisten antara create, patch, dan response.
+
+Jika sudah ada model_config = ConfigDict(from_attributes=True), tidak perlu tambah apa-apa — field
+baru otomatis terpick dari SQLAlchemy model saat serialisasi.
+
+---
+
+4. ROUTER: PATCH /materials/{material_id}
+
+Endpoint PATCH yang sudah ada biasanya pakai pola:
+
+    data = body.model_dump(exclude_unset=True)
+    for field, value in data.items():
+        setattr(material, field, value)
+
+Pastikan pola ini sudah ada. Jika iya, PATCH sudah otomatis support fabric_family tanpa perubahan
+kode tambahan — cukup tambah field di schema saja.
+
+PENTING: exclude_unset=True memastikan:
+- Body `{"fabric_family": "Satin"}` → set fabric_family = "Satin" ✓
+- Body `{"fabric_family": null}` → set fabric_family = None (clear) ✓
+- Body `{"name": "Satin Pink"}` tanpa fabric_family → fabric_family tidak berubah ✓
+
+Tambahkan strip whitespace sebelum simpan untuk konsistensi:
+
+    if material.fabric_family is not None:
+        material.fabric_family = material.fabric_family.strip() or None
+
+---
+
+5. ROUTER: GET /materials/families (ENDPOINT BARU)
+
+Tambah endpoint ini ke router materials. PENTING: daftarkan SEBELUM route /{material_id} agar
+path literal "families" tidak di-parse sebagai UUID.
+
+    @router.get("/families", response_model=list[str])
+    async def get_fabric_families(
+        db: AsyncSession = Depends(get_db),
+        owner: OwnerAccount = Depends(get_current_owner),   # sesuaikan dengan auth pattern yang ada
+    ):
+        """Return distinct non-null fabric_family values untuk owner ini, sorted A-Z."""
+        result = await db.execute(
+            select(Material.fabric_family)
+            .where(
+                Material.owner_id == owner.id,
+                Material.fabric_family.is_not(None),
+                Material.is_archived == False,
+            )
+            .distinct()
+            .order_by(Material.fabric_family)
+        )
+        return [row[0] for row in result.all()]
+
+Jika router memakai auth berbeda (misal get_current_owner vs require_auth), sesuaikan dengan
+pattern yang sudah ada di endpoint lain di file yang sama.
+
+Jika router adalah sync (bukan async), ubah async def → def dan await → tanpa await (sesuaikan
+dengan pola yang sudah ada).
+
+---
+
+6. VERIFIKASI ROUTING ORDER
+
+Setelah tambah endpoint /families, cek urutan di router:
+
+    router.get("/families", ...)        # HARUS lebih dulu
+    router.get("/{material_id}", ...)   # HARUS setelahnya
+
+FastAPI evaluate route dari atas ke bawah. Jika /{material_id} duluan, request ke /families
+akan mencoba parse "families" sebagai UUID → 422 Unprocessable Entity.
+
+---
+
+7. GET /materials (TIDAK ADA PERUBAHAN KODE)
+
+Endpoint GET /materials yang mengembalikan list material sudah otomatis menyertakan fabric_family
+setelah MaterialOut diupdate di langkah 3. Tidak ada perubahan kode di router untuk endpoint ini.
+
+---
+
+8. POST /materials (TIDAK ADA PERUBAHAN KODE)
+
+Sama — CreateMaterialRequest sudah include fabric_family setelah schema diupdate.
+Kode router POST yang sudah ada cukup `Material(**body.model_dump())` atau equivalent — otomatis
+pick field baru.
+
+---
+
+9. TESTING MANUAL (URUTAN YANG DISARANKAN)
+
+Setelah deploy, verifikasi secara berurutan:
+
+a) Migration berhasil:
+   SELECT column_name FROM information_schema.columns
+   WHERE table_name = 'material' AND column_name = 'fabric_family';
+   → harus ada 1 row
+
+b) GET /materials — semua item include fabric_family: null
+
+c) PATCH /materials/{id} dengan {"fabric_family": "Satin"}
+   → GET /materials/{id} → fabric_family: "Satin"
+
+d) PATCH /materials/{id} dengan {"name": "Satin Pink"} (tanpa fabric_family)
+   → GET /materials/{id} → fabric_family tetap "Satin" (tidak berubah)
+
+e) PATCH /materials/{id} dengan {"fabric_family": null}
+   → GET /materials/{id} → fabric_family: null (di-clear)
+
+f) GET /materials/families setelah beberapa material diberi family
+   → ["Nilon", "Satin", "Waffle"] (distinct, sorted, archived excluded)
+
+g) GET /materials/families ketika tidak ada yang diisi → []
+
+h) GET /materials/{valid-uuid} — pastikan tidak conflict dengan /families route
+
+i) POST /materials dengan {"fabric_family": "Satin", ...other required fields}
+   → material tersimpan dengan family, muncul di GET /materials/families
+
+---
+
+DEVIASI YANG BOLEH
+
+- Jika router sudah punya middleware auth di level APIRouter (seperti v3.13), tidak perlu
+  tambah Depends per-endpoint untuk /families.
+- Jika model SQLAlchemy tidak punya owner_id langsung (misalnya diderive via join), sesuaikan
+  filter owner di query GET /materials/families.
+- Jika project memakai sync SQLAlchemy (bukan async), gunakan Session bukan AsyncSession dan
+  hapus await.
+- Strip whitespace boleh dilakukan di Pydantic validator (@field_validator) alih-alih di router —
+  mana yang lebih konsisten dengan pola yang sudah ada.
+
+Catat semua deviasi dari spec ini di baris v3.15 di doc/handoff.md setelah implementasi selesai.
