@@ -1,0 +1,130 @@
+KONTEKS
+=======
+
+Kamu adalah backend developer untuk Oura Studio, sebuah app inventori dan produksi untuk bisnis aksesori handmade. Stack: Supabase (PostgreSQL-compatible), Python/FastAPI atau framework yang sudah ada di project ini.
+
+Versi ini adalah v3.16 — perubahan murni frontend. iOS frontend sekarang punya dua mode saat membuat resep produk:
+
+  1. Varian Kain (default): tiap warna kain jadi varian produk tersendiri.
+     Save path: tiap fabric × tiap ukuran → 1 ProductSize tersendiri (dengan fabric_variant_name) + 1 PatternSpec single-fabric.
+
+  2. Kombo Kain: semua kain masuk dalam satu resep.
+     Save path: semua fabric → 1 PatternSpec per ukuran (behavior lama).
+
+Backend TIDAK perlu mengubah kode apapun untuk logika bisnis. Semua endpoint yang diperlukan sudah ada. Namun ada dua hal yang perlu diverifikasi dan satu optional improvement.
+
+
+TUGAS 1 — VERIFIKASI (WAJIB)
+==============================
+
+Verifikasi bahwa endpoint POST /products/{sku}/sizes mendukung parameter fabric_variant_name.
+
+iOS akan memanggil endpoint ini dengan payload seperti:
+
+  POST /products/SCRMINI/sizes
+  {
+    "size_label": "Free Size",
+    "fabric_variant_name": "Waffle Hijau"
+  }
+
+Cek:
+  a. Apakah parameter fabric_variant_name sudah diterima dan disimpan ke kolom fabric_variant_name di tabel product_sizes?
+  b. Apakah response menyertakan fabric_variant_name dalam JSON yang dikembalikan?
+
+Cara cek cepat — jalankan di Supabase SQL editor:
+  SELECT column_name FROM information_schema.columns
+  WHERE table_name = 'product_sizes' AND column_name = 'fabric_variant_name';
+
+Jika kolom ada → lanjut ke verifikasi endpoint via curl atau test.
+Jika tidak ada → tambahkan migrasi (lihat bagian MIGRASI di bawah, hanya jika diperlukan).
+
+
+TUGAS 2 — VERIFIKASI (WAJIB)
+==============================
+
+Verifikasi bahwa endpoint GET /products/{sku}/sizes mengembalikan fabric_variant_name dalam response.
+
+iOS membaca field ini untuk mengecek apakah ProductSize untuk fabric tertentu sudah ada sebelum membuat yang baru:
+
+  allSizes.first {
+    $0.sizeLabel == sizeLabel && $0.fabricVariantName == fabric.name
+  }
+
+Jika fabric_variant_name tidak ada di response, iOS akan terus membuat ProductSize baru untuk setiap save — menyebabkan duplikat.
+
+Cara cek: hit endpoint dan inspeksi response:
+  GET /products/{sku}/sizes
+  → tiap item harus punya field "fabric_variant_name" (boleh null untuk base size)
+
+Jika field sudah ada di response → tidak perlu perubahan.
+Jika tidak ada → tambahkan ke serializer/schema response (bukan model change, hanya response shape).
+
+
+TUGAS 3 — OPTIONAL IMPROVEMENT
+================================
+
+Saat ini iOS melakukan pre-check (cari existing di allSizes lokal) sebelum memanggil POST /products/{sku}/sizes. Ini mencegah duplikat dalam satu session, tapi jika user save dari dua device atau ada race condition, backend masih bisa menerima duplicate insert.
+
+Pertimbangkan menambahkan upsert behavior ke POST /products/{sku}/sizes:
+
+  Jika sudah ada row dengan (product_id, size_label, fabric_variant_name) yang sama:
+    → return 200 dengan existing record (idempotent)
+  Jika belum ada:
+    → insert baru, return 201
+
+Implementasi contoh (Python/SQLAlchemy):
+
+  existing = db.query(ProductSize).filter(
+      ProductSize.product_id == product.id,
+      ProductSize.size_label == body.size_label,
+      ProductSize.fabric_variant_name == body.fabric_variant_name,
+  ).first()
+  if existing:
+      return existing  # idempotent — iOS handles 200 or 201 the same
+
+Atau via Supabase upsert:
+  supabase.table("product_sizes")
+    .upsert({
+      "product_id": product_id,
+      "size_label": size_label,
+      "fabric_variant_name": fabric_variant_name,
+    }, on_conflict="product_id,size_label,fabric_variant_name")
+    .execute()
+
+Catatan: ini nice-to-have. iOS sudah aman tanpa ini karena pre-check lokal. Namun idempotent endpoint lebih robust untuk edge cases.
+
+
+MIGRASI (hanya jika Tugas 1 menemukan kolom belum ada)
+========================================================
+
+Jika kolom fabric_variant_name belum ada di product_sizes, tambahkan via Supabase SQL:
+
+  ALTER TABLE product_sizes
+  ADD COLUMN IF NOT EXISTS fabric_variant_name TEXT;
+
+Tidak ada NOT NULL constraint — base sizes tidak punya fabric_variant_name (nilainya NULL).
+
+Setelah migrasi, pastikan:
+  1. Existing rows tidak terpengaruh (fabric_variant_name = NULL untuk semua yang sudah ada)
+  2. Unique constraint jika ada perlu di-review: jika ada UNIQUE(product_id, size_label), harus diubah ke UNIQUE(product_id, size_label, fabric_variant_name) agar base size + variant size untuk label yang sama bisa koeksis.
+
+
+ENDPOINT YANG DIPAKAI iOS v3.16 (SUMMARY)
+==========================================
+
+  | Endpoint                        | Dipakai untuk                                    |
+  |---------------------------------|--------------------------------------------------|
+  | GET /products/{sku}/sizes       | Load existing sizes sebelum save                 |
+  | POST /products/{sku}/sizes      | Buat variant size baru (dengan fabric_variant_name) |
+  | POST /pattern-specs             | Buat spec (single fabric untuk Varian Kain)      |
+
+Semua endpoint ini sudah ada sejak v1.7. Tidak ada endpoint baru yang perlu dibuat.
+
+
+DEFINISI OF DONE
+=================
+
+  [ ] GET /products/{sku}/sizes → response tiap item punya "fabric_variant_name" (null atau string)
+  [ ] POST /products/{sku}/sizes → menerima "fabric_variant_name" dan menyimpannya
+  [ ] POST /products/{sku}/sizes → response menyertakan "fabric_variant_name"
+  [ ] (Opsional) POST /products/{sku}/sizes → idempotent jika (product_id, size_label, fabric_variant_name) sudah ada
