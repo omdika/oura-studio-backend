@@ -1,0 +1,165 @@
+KONTEKS
+=======
+
+Kamu adalah backend developer untuk Oura Studio, app inventori dan produksi aksesori handmade. Stack: Supabase (PostgreSQL-compatible), Python/FastAPI (atau framework yang sudah ada di project ini).
+
+v3.17 menambahkan fitur QR Code ke iOS app. iOS akan generate QR per varian produk (ProductSize), lalu scan QR untuk langsung catat penjualan atau stok masuk. QR mengkodekan string `oura:{productSizeId}` — UUID dari tabel product_sizes.
+
+Saat scan, iOS perlu resolve UUID tersebut ke data lengkap produk (nama, size, harga, stok) tanpa tahu SKU-nya terlebih dahulu. Untuk itu dibutuhkan satu endpoint baru.
+
+
+TUGAS SATU-SATUNYA
+==================
+
+Buat endpoint baru:
+
+  GET /product-sizes/{size_id}
+
+Endpoint ini me-lookup satu ProductSize berdasarkan UUID-nya dan mengembalikan data lengkap
+identik dengan item dari GET /products/{sku}/sizes — reuse query + serializer yang sudah ada.
+
+
+DETAIL ENDPOINT
+===============
+
+Method  : GET
+Path    : /product-sizes/{size_id}
+Auth    : Bearer token wajib (sama seperti endpoint lain)
+Params  : size_id (UUID) — path parameter
+
+Response 200 OK — shape identik dengan item dari GET /products/{sku}/sizes:
+
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "product_id": "...",
+    "product_sku": "SCRMINI",
+    "product_name": "Scrunchie Mini",
+    "size_label": "Free Size",
+    "fabric_variant_name": "Waffle Hijau",   // null untuk base size
+    "reorder_min_qty": 5,
+    "is_archived": false,
+    "current_stock_qty": 12,
+    "production_stock_qty": 10,
+    "manual_stock_qty": 2,
+    "selling_price": 25000,
+    "margin_pct": 0.45,
+    "latest_hpp_breakdown": {
+      "fabric": 8200,
+      "fabric_items": [],
+      "pooled_material": 300,
+      "hardware": 500,
+      "hardware_items": [],
+      "labor": 3000,
+      "overhead": 1750,
+      "total": 13750
+    }
+  }
+
+  PENTING: field "product_sku" dan "product_name" harus ada — iOS butuh ini.
+  Wajib JOIN tabel products untuk mendapatkannya.
+  Field "latest_hpp_breakdown" boleh null jika belum pernah diproduksi.
+
+Response 404 — jika size_id tidak ditemukan:
+  { "detail": "Product size not found" }
+
+Response 422 — jika size_id bukan UUID valid (FastAPI handle otomatis).
+
+
+IMPLEMENTASI
+============
+
+Tidak perlu buat query baru dari nol. Endpoint GET /products/{sku}/sizes sudah
+melakukan JOIN yang sama dan mengembalikan shape yang sama. Ekstrak logikanya ke
+sebuah helper/repository function, lalu panggil dari kedua route:
+
+  # Contoh struktur (sesuaikan dengan pola yang sudah ada di project):
+
+  # Repository / service layer:
+  async def get_product_size_detail(db, size_id: UUID) -> ProductSizeDetailOut | None:
+      # Reuse query yang sudah ada di GET /products/{sku}/sizes
+      # Ganti filter "WHERE ps.product_id = product.id" dengan "WHERE ps.id = :size_id"
+      # JOIN products p ON p.id = ps.product_id untuk dapat product_sku + product_name
+      ...
+
+  # Route baru:
+  @router.get("/product-sizes/{size_id}", response_model=ProductSizeDetailOut)
+  async def get_product_size_by_id(
+      size_id: UUID,
+      db: AsyncSession = Depends(get_db),
+      current_user = Depends(get_current_user),
+  ):
+      size = await get_product_size_detail(db, size_id)
+      if not size:
+          raise HTTPException(status_code=404, detail="Product size not found")
+      return size
+
+SQL dasar (sesuaikan dengan ORM yang dipakai):
+
+  SELECT
+    ps.id,
+    ps.product_id,
+    p.sku          AS product_sku,
+    p.name         AS product_name,
+    ps.size_label,
+    ps.fabric_variant_name,
+    ps.reorder_min_qty,
+    ps.is_archived,
+    ps.selling_price,
+    COALESCE(stock.current_stock_qty, 0)    AS current_stock_qty,
+    COALESCE(stock.production_stock_qty, 0) AS production_stock_qty,
+    COALESCE(stock.manual_stock_qty, 0)     AS manual_stock_qty,
+    hpp.breakdown  AS latest_hpp_breakdown,
+    hpp.margin_pct
+  FROM product_sizes ps
+  JOIN products p ON p.id = ps.product_id
+  LEFT JOIN (...stock aggregation...) stock ON stock.product_size_id = ps.id
+  LEFT JOIN (...latest HPP...) hpp ON hpp.product_size_id = ps.id
+  WHERE ps.id = :size_id
+
+
+ROUTE REGISTRATION
+==================
+
+Daftarkan route "/product-sizes/{size_id}" di router yang sesuai. Pastikan tidak
+konflik dengan route lain. Tidak ada kekhawatiran konflik dengan "/products/{sku}/sizes"
+karena prefix-nya berbeda.
+
+Jika router diorganisir per prefix (misal APIRouter(prefix="/products")), buat router
+terpisah dengan prefix "" atau "/product-sizes" untuk endpoint ini.
+
+
+TIDAK ADA YANG LAIN
+===================
+
+Tidak ada migration. Tidak ada tabel baru. Tidak ada perubahan endpoint lain.
+Tidak ada perubahan pada POST /sales-orders atau POST stock adjustment — kedua endpoint
+itu sudah dipakai iOS dengan cara yang sama, tidak perlu diubah.
+
+
+CARA CEK CEPAT
+==============
+
+Setelah implementasi, verifikasi dengan curl:
+
+  # Ambil salah satu size_id yang valid dari DB:
+  SELECT id FROM product_sizes LIMIT 1;
+
+  # Hit endpoint:
+  curl -H "Authorization: Bearer {token}" \
+       https://{base_url}/product-sizes/{size_id}
+
+  Pastikan response punya field: id, product_sku, product_name, size_label,
+  fabric_variant_name, current_stock_qty, selling_price.
+
+
+DEFINITION OF DONE
+==================
+
+  [ ] GET /product-sizes/{size_id} tersedia dan mengembalikan 200 dengan shape lengkap
+  [ ] Response include "product_sku" dan "product_name" (dari JOIN products)
+  [ ] Response include "current_stock_qty" (dari aggregation stock ledger)
+  [ ] Response include "latest_hpp_breakdown" (null jika belum ada)
+  [ ] 404 jika UUID tidak ditemukan (bukan 500)
+  [ ] 422 jika bukan UUID valid
+  [ ] Endpoint dilindungi auth — 401 tanpa token
+  [ ] Tidak ada regression di endpoint GET /products/{sku}/sizes yang sudah ada

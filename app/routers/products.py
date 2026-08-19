@@ -29,6 +29,7 @@ from app.schemas.product import (
     ProductSizeDetailOut,
     ProductSizeOut,
     ProductSizeUpdate,
+    ProductSizeWithProductOut,
     ProductUpdate,
     PurchaseConsumedOut,
 )
@@ -336,6 +337,15 @@ def _size_detail_out(db: Session, size: ProductSize) -> ProductSizeDetailOut:
     return _detail_out(size, stock_qty, production_qty, manual_qty, latest_item, fabric_items, hardware_items)
 
 
+def _size_detail_with_product_out(db: Session, size: ProductSize, product: Product) -> ProductSizeWithProductOut:
+    """v3.17: reuses _size_detail_out's query/serializer, adds product_sku/product_name on top --
+    needed by GET /product-sizes/{size_id} since that URL doesn't carry the SKU the way
+    GET /products/{sku}/sizes does.
+    """
+    detail = _size_detail_out(db, size)
+    return ProductSizeWithProductOut(**detail.model_dump(), product_sku=product.sku, product_name=product.name)
+
+
 @router.post("/products", response_model=ProductOut, status_code=status.HTTP_201_CREATED)
 def create_product(body: ProductCreate, db: Session = Depends(get_db)):
     if body.sku is not None:
@@ -479,6 +489,19 @@ def get_product_size(sku: str, size_id: uuid.UUID, db: Session = Depends(get_db)
     product = _get_product_or_404(db, sku)
     size = _get_size_or_404(db, product, size_id)
     return _size_detail_out(db, size)
+
+
+@router.get("/product-sizes/{size_id}", response_model=ProductSizeWithProductOut)
+def get_product_size_by_id(size_id: uuid.UUID, db: Session = Depends(get_db)):
+    """v3.17: QR-code scan lookup. QR encodes "oura:{productSizeId}" -- iOS resolves the UUID to
+    full product/size/stock/HPP data without knowing the SKU up front, unlike the sku-scoped
+    /products/{sku}/sizes/{size_id} above.
+    """
+    size = db.get(ProductSize, size_id)
+    if size is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product size not found")
+    product = db.get(Product, size.product_id)
+    return _size_detail_with_product_out(db, size, product)
 
 
 @router.patch("/products/{sku}/sizes/{size_id}", response_model=ProductSizeOut)

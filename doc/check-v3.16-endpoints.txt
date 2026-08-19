@@ -1,0 +1,83 @@
+CEK KESIAPAN BACKEND UNTUK v3.16
+==================================
+
+Frontend iOS v3.16 sudah selesai dan butuh dua endpoint yang support fabric_variant_name.
+Lakukan dua cek berikut, laporkan hasilnya (ada/tidak ada field-nya).
+
+
+CEK 1 — GET /products/{sku}/sizes
+------------------------------------
+
+Hit endpoint ini dengan SKU yang punya minimal satu size:
+
+  GET /api/products/{sku}/sizes
+
+Contoh response yang BENAR (siap v3.16):
+
+  [
+    {
+      "id": "...",
+      "size_label": "Free Size",
+      "fabric_variant_name": null,      ← field ini harus ada (boleh null)
+      "current_stock_qty": 0,
+      ...
+    },
+    {
+      "id": "...",
+      "size_label": "Free Size",
+      "fabric_variant_name": "Waffle Hijau",   ← jika sudah ada variant
+      ...
+    }
+  ]
+
+Yang dicek: apakah key "fabric_variant_name" ada di tiap item response?
+  → YA  : endpoint siap, tidak perlu perubahan
+  → TIDAK: serializer/schema perlu ditambahkan field ini
+
+
+CEK 2 — POST /products/{sku}/sizes dengan fabric_variant_name
+---------------------------------------------------------------
+
+Kirim request ini:
+
+  POST /api/products/{sku}/sizes
+  Content-Type: application/json
+
+  {
+    "size_label": "Test Size",
+    "fabric_variant_name": "Test Fabric"
+  }
+
+Response yang BENAR:
+
+  {
+    "id": "...",
+    "size_label": "Test Size",
+    "fabric_variant_name": "Test Fabric",   ← harus tersimpan dan dikembalikan
+    ...
+  }
+
+Yang dicek:
+  a. Apakah request tidak error 422/400 karena field tidak dikenal?
+  b. Apakah fabric_variant_name tersimpan (cek di DB: SELECT * FROM product_sizes WHERE size_label = 'Test Size')?
+  c. Apakah fabric_variant_name muncul di response?
+
+  → Semua YA : endpoint siap, tidak perlu perubahan
+  → Ada yang TIDAK: perlu fix (lihat implement-v3.16-varian-resep.txt)
+
+Hapus test row setelah cek:
+  DELETE FROM product_sizes WHERE size_label = 'Test Size';
+
+
+LAPORAN YANG DIBUTUHKAN
+========================
+
+Cukup jawab:
+
+  CEK 1: field fabric_variant_name ada di response? [YA/TIDAK]
+  CEK 2a: POST tidak error? [YA/TIDAK]
+  CEK 2b: tersimpan di DB? [YA/TIDAK]
+  CEK 2c: ada di response? [YA/TIDAK]
+
+Kalau semua YA → v3.16 siap di-test dari iOS.
+Kalau ada TIDAK → ikuti instruksi di implement-v3.16-varian-resep.txt.

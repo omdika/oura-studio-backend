@@ -72,6 +72,19 @@ class ProductSizeDetailOut(ProductSizeOut):
     margin_pct: float | None
 
 
+class ProductSizeWithProductOut(ProductSizeDetailOut):
+    """v3.17: same shape as ProductSizeDetailOut, plus product_sku/product_name.
+
+    Used by GET /product-sizes/{size_id} (QR-code lookup) -- unlike GET /products/{sku}/sizes,
+    that endpoint's URL doesn't carry the SKU, so the response has to embed it. Kept as a
+    separate model rather than adding these fields to ProductSizeDetailOut so the existing
+    GET /products/{sku}/sizes response shape doesn't change (no regression).
+    """
+
+    product_sku: str
+    product_name: str
+
+
 class DeleteResultOut(BaseModel):
     deleted: bool  # True = hard-deleted, False = archived instead
 
