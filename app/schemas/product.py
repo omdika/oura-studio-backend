@@ -145,15 +145,3 @@ class AddStockFromBahanRequest(BaseModel):
     # layer to use when the active PatternSpec has more than one). Omit to FIFO across all
     # purchases of the spec's single fabric layer's material (oldest purchased_at first).
     material_purchase_id: uuid.UUID | None = None
-
-
-class PurchaseConsumedOut(BaseModel):
-    material_purchase_id: uuid.UUID
-    length_cm_consumed: float
-
-
-class AddStockFromBahanResponse(BaseModel):
-    stock_ledger_id: uuid.UUID
-    change_qty: int
-    fabric_length_consumed_cm: float
-    purchases_consumed: list[PurchaseConsumedOut]

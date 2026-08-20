@@ -17,7 +17,6 @@ from app.models.sales import SalesOrderItem
 from app.models.stock import StockLedger
 from app.schemas.product import (
     AddStockFromBahanRequest,
-    AddStockFromBahanResponse,
     DeleteResultOut,
     HppBreakdownOut,
     HppLineItemOut,
@@ -31,8 +30,8 @@ from app.schemas.product import (
     ProductSizeUpdate,
     ProductSizeWithProductOut,
     ProductUpdate,
-    PurchaseConsumedOut,
 )
+from app.routers.production import _fifo_deduct_hardware
 from app.routers.sales import get_hpp_for_sale
 from app.services.pricing import compute_margin_pct, compute_markup_pct, compute_suggested_price
 
@@ -585,18 +584,22 @@ def price_advisor(sku: str, size_id: uuid.UUID, body: PriceAdvisorRequest, db: S
     )
 
 
-@router.post("/products/{sku}/sizes/{size_id}/stock-from-bahan", response_model=AddStockFromBahanResponse)
+@router.post("/products/{sku}/sizes/{size_id}/stock-from-bahan", response_model=ProductSizeDetailOut)
 def add_stock_from_bahan(sku: str, size_id: uuid.UUID, body: AddStockFromBahanRequest, db: Session = Depends(get_db)):
-    """Optional endpoint (handoff v1.8-v2.0): seed initial stock for a new fabric variant directly
-    from an existing bahan (fabric) purchase, bypassing the full cutting-optimizer/production-batch
-    pipeline. Two things the handoff never spells out (flagged here rather than silently assumed):
+    """Add stock for a size directly from bahan (fabric + hardware/component consumption per its
+    PatternSpec), bypassing the full cutting-optimizer/production-batch pipeline. Handles both the
+    original "Stok Awal" manual-entry flow (handoff v1.8-v2.0) and the QR-scan "Dari Produksi" flow
+    (doc/fix-stock-from-bahan.txt) -- same endpoint, same shape, both represent bahan genuinely
+    being consumed to produce stock. Two things neither spec spells out precisely (flagged here
+    rather than silently assumed):
 
     1. Fabric length consumed per unit is approximated as `qty * fabric.cut_height_cm` (cut_width_cm
        is treated as across-the-roll width, not consumed length) -- a straight-line estimate with no
-       nesting/rotation optimization. This is only appropriate for manual initial-stock entry; real
+       nesting/rotation optimization. This is only appropriate for manual/QR stock entry; real
        production costing should go through POST /cutting-optimizer/suggest + /production-batches instead.
     2. Because this bypasses ProductionBatch, there is no computed hpp_total to snapshot, so the written
-       stock_ledger row has unit_hpp_snapshot=None and reason='adjustment' (not 'production').
+       stock_ledger row has unit_hpp_snapshot=None -- matching doc/fix-stock-from-bahan.txt's own
+       expected response, which shows latest_hpp_breakdown staying null after this call.
 
     v2.15: a PatternSpec can now carry N fabric layers. `material_purchase_id` (if passed) also
     disambiguates which fabric layer to consume against; with exactly one fabric layer on the spec
@@ -607,6 +610,16 @@ def add_stock_from_bahan(sku: str, size_id: uuid.UUID, body: AddStockFromBahanRe
     Also accepts `spec_id` so the frontend (which already fetched it from GET /pattern-specs) can
     name the spec directly instead of relying on the "exactly one active spec for this size"
     lookup below, which 400s if that invariant is ever violated.
+
+    doc/fix-stock-from-bahan.txt (this round): three behavior changes from the endpoint's original
+    "Stok Awal" design --
+      (a) reason changed 'adjustment' -> 'production' so current_stock_qty lands in
+          production_stock_qty, not manual_stock_qty, per that doc's own worked example response.
+      (b) spec.components (hardware/thread/packaging) are now also deducted via the same FIFO
+          helper POST /production-batches/{id}/confirm uses, not just spec.fabrics -- the original
+          "Stok Awal" version never touched components at all.
+      (c) response body changed from a bahan-consumption receipt to the same ProductSizeDetailOut
+          shape GET /products/{sku}/sizes returns, per that doc's spec.
     """
     product = _get_product_or_404(db, sku)
     size = _get_size_or_404(db, product, size_id)
@@ -659,7 +672,6 @@ def add_stock_from_bahan(sku: str, size_id: uuid.UUID, body: AddStockFromBahanRe
         if (purchase.remaining_length_cm or 0) < length_needed_cm:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Insufficient remaining fabric on this purchase")
         purchase.remaining_length_cm -= length_needed_cm
-        consumed = [PurchaseConsumedOut(material_purchase_id=purchase.id, length_cm_consumed=length_needed_cm)]
     else:
         candidates = (
             db.query(MaterialPurchase)
@@ -668,33 +680,29 @@ def add_stock_from_bahan(sku: str, size_id: uuid.UUID, body: AddStockFromBahanRe
             .all()
         )
         remaining_needed = length_needed_cm
-        consumed = []
         for purchase in candidates:
             if remaining_needed <= 0:
                 break
             take = min(purchase.remaining_length_cm, remaining_needed)
             purchase.remaining_length_cm -= take
             remaining_needed -= take
-            consumed.append(PurchaseConsumedOut(material_purchase_id=purchase.id, length_cm_consumed=take))
         if remaining_needed > 0:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Insufficient fabric stock across all purchases of this material",
             )
 
+    for component in db.query(PatternComponent).filter(PatternComponent.pattern_spec_id == spec.id).all():
+        _fifo_deduct_hardware(db, component.material_id, component.qty_per_unit * body.qty)
+
     entry = StockLedger(
         product_size_id=size.id,
         change_qty=body.qty,
-        reason="adjustment",
-        note="Initial stock dari Bahan (addStockFromBahan, FIFO fabric deduction)",
+        reason="production",
+        note="Stok dari Bahan (stock-from-bahan, FIFO fabric + hardware deduction)",
     )
     db.add(entry)
     db.commit()
-    db.refresh(entry)
+    db.refresh(size)
 
-    return AddStockFromBahanResponse(
-        stock_ledger_id=entry.id,
-        change_qty=body.qty,
-        fabric_length_consumed_cm=length_needed_cm,
-        purchases_consumed=consumed,
-    )
+    return _size_detail_out(db, size)
