@@ -137,6 +137,10 @@ class StockAdjustmentOut(BaseModel):
 
 class AddStockFromBahanRequest(BaseModel):
     qty: int = Field(gt=0)
+    # v3.19: frontend fetches the spec from GET /pattern-specs and passes its id explicitly,
+    # rather than relying on the "single active PatternSpec for this size" implicit lookup below.
+    # Optional for backward compatibility -- omit to fall back to that implicit lookup.
+    spec_id: uuid.UUID | None = None
     # Optional: pin consumption to one specific purchase batch (also disambiguates which fabric
     # layer to use when the active PatternSpec has more than one). Omit to FIFO across all
     # purchases of the spec's single fabric layer's material (oldest purchased_at first).

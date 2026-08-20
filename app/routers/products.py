@@ -585,7 +585,7 @@ def price_advisor(sku: str, size_id: uuid.UUID, body: PriceAdvisorRequest, db: S
     )
 
 
-@router.post("/products/{sku}/sizes/{size_id}/addStockFromBahan", response_model=AddStockFromBahanResponse)
+@router.post("/products/{sku}/sizes/{size_id}/stock-from-bahan", response_model=AddStockFromBahanResponse)
 def add_stock_from_bahan(sku: str, size_id: uuid.UUID, body: AddStockFromBahanRequest, db: Session = Depends(get_db)):
     """Optional endpoint (handoff v1.8-v2.0): seed initial stock for a new fabric variant directly
     from an existing bahan (fabric) purchase, bypassing the full cutting-optimizer/production-batch
@@ -601,24 +601,38 @@ def add_stock_from_bahan(sku: str, size_id: uuid.UUID, body: AddStockFromBahanRe
     v2.15: a PatternSpec can now carry N fabric layers. `material_purchase_id` (if passed) also
     disambiguates which fabric layer to consume against; with exactly one fabric layer on the spec
     it's optional as before.
+
+    v3.19: path renamed from addStockFromBahan (camelCase) to stock-from-bahan (kebab-case) to
+    match what the frontend actually calls -- the old path/casing was a live 404 on device.
+    Also accepts `spec_id` so the frontend (which already fetched it from GET /pattern-specs) can
+    name the spec directly instead of relying on the "exactly one active spec for this size"
+    lookup below, which 400s if that invariant is ever violated.
     """
     product = _get_product_or_404(db, sku)
     size = _get_size_or_404(db, product, size_id)
 
-    active_specs = db.query(PatternSpec).filter(
-        PatternSpec.product_size_id == size.id, PatternSpec.is_active.is_(True)
-    ).all()
-    if not active_specs:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No active PatternSpec for this product size — cannot compute fabric consumption",
-        )
-    if len(active_specs) > 1:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Multiple active PatternSpecs found for this product size — ambiguous, pass material_purchase_id",
-        )
-    spec = active_specs[0]
+    if body.spec_id is not None:
+        spec = db.get(PatternSpec, body.spec_id)
+        if spec is None or spec.product_size_id != size.id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="spec_id not found for this product size",
+            )
+    else:
+        active_specs = db.query(PatternSpec).filter(
+            PatternSpec.product_size_id == size.id, PatternSpec.is_active.is_(True)
+        ).all()
+        if not active_specs:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No active PatternSpec for this product size — cannot compute fabric consumption",
+            )
+        if len(active_specs) > 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Multiple active PatternSpecs found for this product size — ambiguous, pass spec_id",
+            )
+        spec = active_specs[0]
 
     purchase = db.get(MaterialPurchase, body.material_purchase_id) if body.material_purchase_id is not None else None
     if body.material_purchase_id is not None and purchase is None:
