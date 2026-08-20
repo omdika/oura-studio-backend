@@ -6,8 +6,11 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.deps import get_current_owner
+from app.models.material import Material
+from app.models.pattern import PatternComponent, PatternSpec
 from app.models.product import Product, ProductSize
 from app.models.sales import SalesOrder, SalesOrderItem
+from app.models.settings import Setting
 from app.models.stock import StockLedger
 from app.schemas.sales import (
     CancelRequest,
@@ -16,6 +19,8 @@ from app.schemas.sales import (
     SalesOrderOut,
     SalesOrderStatusUpdate,
 )
+from app.services.cutting_optimizer import estimate_fabric_cost_per_piece_from_rate
+from app.services.hpp import compute_hpp
 
 router = APIRouter(prefix="/sales-orders", tags=["sales"], dependencies=[Depends(get_current_owner)])
 
@@ -61,6 +66,7 @@ def _item_out(item: SalesOrderItem, size_map: dict[uuid.UUID, tuple[str, str]]) 
         unit_price=item.unit_price,
         discount=item.discount,
         unit_hpp_snapshot=item.unit_hpp_snapshot,
+        hpp_source=item.hpp_source,
         line_profit=item.line_profit,
         line_revenue=(item.unit_price - item.discount) * item.qty,
     )
@@ -110,6 +116,89 @@ def _latest_hpp_snapshot(db: Session, product_size_id: uuid.UUID) -> float | Non
     return row.unit_hpp_snapshot if row else None
 
 
+def _get_setting(db: Session, key: str) -> float | None:
+    setting = db.get(Setting, key)
+    return setting.value if setting is not None else None
+
+
+def _pooled_material_rate_sum(db: Session) -> float:
+    rows = db.query(Setting).filter(Setting.key.like("pooled_material_rate:%")).all()
+    return sum(s.value for s in rows)
+
+
+def _hardware_cost_per_unit(db: Session, pattern_spec_id: uuid.UUID) -> float:
+    # Mirrors routers/production.py's confirm-time hardware cost -- filtered defensively to
+    # category='hardware' since POST /pattern-specs doesn't enforce that server-side either.
+    rows = (
+        db.query(PatternComponent, Material)
+        .join(Material, PatternComponent.material_id == Material.id)
+        .filter(
+            PatternComponent.pattern_spec_id == pattern_spec_id,
+            Material.category == "hardware",
+            Material.cost_class == "direct_precise",
+        )
+        .all()
+    )
+    return sum(comp.qty_per_unit * material.current_avg_cost for comp, material in rows)
+
+
+def _latest_active_pattern_spec(db: Session, product_size_id: uuid.UUID) -> PatternSpec | None:
+    return (
+        db.query(PatternSpec)
+        .filter(PatternSpec.product_size_id == product_size_id, PatternSpec.is_active.is_(True))
+        .order_by(PatternSpec.effective_from.desc())
+        .first()
+    )
+
+
+def get_hpp_for_sale(db: Session, product_size_id: uuid.UUID) -> tuple[float, str]:
+    """v3.18 -- three-tier HPP fallback so a sale is never blocked just because stock was entered
+    manually (adjustStock / stok awal) rather than through a confirmed production batch.
+
+    Tier 1: latest confirmed production_batch_item HPP, via stock_ledger's snapshot (existing
+            behavior, unchanged) -- hpp_source = "batch".
+    Tier 2: no batch yet, but an active PatternSpec exists -- estimate HPP from its fabric/hardware/
+            labor/overhead, same formula as batch confirm (services/hpp.compute_hpp) -- hpp_source
+            = "pattern_spec".
+    Tier 3: no batch, no active PatternSpec (product entered before any resep existed) -- hpp=0,
+            sale still allowed -- hpp_source = "manual".
+    """
+    batch_hpp = _latest_hpp_snapshot(db, product_size_id)
+    if batch_hpp is not None:
+        return batch_hpp, "batch"
+
+    spec = _latest_active_pattern_spec(db, product_size_id)
+    if spec is not None:
+        labor_rate = _get_setting(db, "labor_rate_per_minute") or 0.0
+        overhead = _get_setting(db, "default_overhead_per_unit") or 0.0
+        pooled_rate = _pooled_material_rate_sum(db)
+        hardware_cost = _hardware_cost_per_unit(db, spec.id)
+
+        fabric_cost = sum(
+            estimate_fabric_cost_per_piece_from_rate(
+                fabric_width_cm=fabric.material.fabric_width_cm,
+                cut_width_cm=fabric.cut_width_cm,
+                cut_height_cm=fabric.cut_height_cm,
+                rotation_allowed=fabric.rotation_allowed,
+                cost_per_cm=fabric.material.current_avg_cost,
+            )
+            for fabric in spec.fabrics
+            if fabric.material is not None
+        )
+
+        breakdown = compute_hpp(
+            fabric_cost_per_piece=fabric_cost,
+            pooled_material_rate=pooled_rate,
+            hardware_cost_per_unit=hardware_cost,
+            est_labor_minutes=spec.est_labor_minutes,
+            labor_rate_per_minute=labor_rate,
+            overhead_per_unit=overhead,
+        )
+        return breakdown.hpp_total, "pattern_spec"
+
+    return 0.0, "manual"
+
+
 def _generate_invoice_no(db: Session) -> str:
     # Format not specified by the handoff -- this implementation's own choice: sequential,
     # zero-padded. Safe against gaps since sales_order rows are never hard-deleted (Section 5:
@@ -133,15 +222,10 @@ def create_sales_order(body: SalesOrderCreate, db: Session = Depends(get_db)):
                 detail=f"Insufficient stock for product_size_id {line.product_size_id}: have {available}, need {line.qty}",
             )
 
-        hpp_snapshot = _latest_hpp_snapshot(db, size.id)
-        if hpp_snapshot is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"No HPP recorded yet for product_size_id {line.product_size_id} -- cannot compute profit",
-            )
+        hpp_snapshot, hpp_source = get_hpp_for_sale(db, size.id)
 
         line_profit = (line.unit_price - line.discount - hpp_snapshot) * line.qty
-        resolved_items.append((line, hpp_snapshot, line_profit))
+        resolved_items.append((line, hpp_snapshot, hpp_source, line_profit))
 
     order = SalesOrder(
         invoice_no=_generate_invoice_no(db),
@@ -153,7 +237,7 @@ def create_sales_order(body: SalesOrderCreate, db: Session = Depends(get_db)):
     db.add(order)
     db.flush()
 
-    for line, hpp_snapshot, line_profit in resolved_items:
+    for line, hpp_snapshot, hpp_source, line_profit in resolved_items:
         db.add(
             SalesOrderItem(
                 sales_order_id=order.id,
@@ -162,6 +246,7 @@ def create_sales_order(body: SalesOrderCreate, db: Session = Depends(get_db)):
                 unit_price=line.unit_price,
                 discount=line.discount,
                 unit_hpp_snapshot=hpp_snapshot,
+                hpp_source=hpp_source,
                 line_profit=line_profit,
             )
         )

@@ -37,5 +37,7 @@ class SalesOrderItem(Base):
     discount: Mapped[float] = mapped_column(Numeric(asdecimal=False), nullable=False, default=0)
     unit_hpp_snapshot: Mapped[float] = mapped_column(Numeric(asdecimal=False), nullable=False)
     line_profit: Mapped[float] = mapped_column(Numeric(asdecimal=False), nullable=False)
+    # v3.18: which tier of the HPP fallback produced unit_hpp_snapshot -- batch | pattern_spec | manual.
+    hpp_source: Mapped[str] = mapped_column(String(20), nullable=False, default="batch")
 
     sales_order: Mapped["SalesOrder"] = relationship(back_populates="items")

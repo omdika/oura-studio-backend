@@ -320,3 +320,33 @@ def estimate_fabric_cost_per_piece(
     if geom.pieces_per_row <= 0 or geom.row_length_cm <= 0:
         return 0.0
     return (cost_per_cm * geom.row_length_cm) / geom.pieces_per_row
+
+
+def estimate_fabric_cost_per_piece_from_rate(
+    fabric_width_cm: float | None,
+    cut_width_cm: float,
+    cut_height_cm: float,
+    rotation_allowed: bool,
+    cost_per_cm: float,
+) -> float:
+    """v3.18 -- HPP fallback (sales-order snapshot) for stock that never went through a confirmed
+    production batch, so there's no MaterialPurchase/CuttingLayout to nest against yet. Picks
+    whichever allowed orientation packs densest against a hypothetical roll of fabric_width_cm
+    (same normal/rotated geometry the real optimizer uses), which minimizes cost-per-piece and
+    doesn't require knowing an actual roll length. Falls back to a full row per piece (no nesting)
+    when the material has no fabric_width_cm on record, or when neither orientation fits.
+    """
+    if cost_per_cm <= 0:
+        return 0.0
+    if fabric_width_cm is None or fabric_width_cm <= 0:
+        return cost_per_cm * cut_height_cm
+
+    orientations = [normal_geometry(fabric_width_cm, cut_width_cm, cut_height_cm)]
+    if rotation_allowed:
+        orientations.append(rotated_geometry(fabric_width_cm, cut_width_cm, cut_height_cm))
+    feasible_costs = [
+        (cost_per_cm * geom.row_length_cm) / geom.pieces_per_row
+        for geom in orientations
+        if geom.pieces_per_row > 0 and geom.row_length_cm > 0
+    ]
+    return min(feasible_costs) if feasible_costs else cost_per_cm * cut_height_cm

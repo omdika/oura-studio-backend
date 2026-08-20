@@ -6,6 +6,26 @@ Versi detail masing-masing task ada di doc/backend/versions/.
 
 ---
 
+🔴 CRITICAL — POST /sales-orders: blokir penjualan jika produk tanpa HPP batch (v3.18)
+=======================================================================================
+
+Problem: penjualan produk yang stoknya diinput manual (adjustStock/stok awal) gagal dengan error
+"No HPP recorded yet for product_size_id ... — cannot compute profit". iOS tidak bisa catat
+penjualan produk tersebut sama sekali, meski stok dan harga jual sudah ada.
+
+Fix yang dibutuhkan: tiga-tier HPP fallback di POST /sales-orders:
+  Tier 1 — ambil dari production_batch_item terkonfirmasi (existing, jangan diubah)
+  Tier 2 — jika tidak ada batch, hitung dari PatternSpec aktif terbaru:
+            fabric_cost + hardware_cost + labor_cost + overhead_cost
+  Tier 3 — jika tidak ada PatternSpec, gunakan hpp = 0 (jangan blokir penjualan)
+
+Schema change: ADD COLUMN hpp_source VARCHAR(20) DEFAULT 'batch' di sales_order_item
+Pydantic change: tambah hpp_source: str = "batch" di SalesOrderItemOut
+
+Spec lengkap: doc/implement-v3.18-hpp-fallback.txt
+
+---
+
 🔴 CRITICAL — GET /reports/dashboard: field month-level belum ada
 =================================================================
 

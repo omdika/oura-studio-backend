@@ -1,0 +1,170 @@
+KONTEKS
+=======
+
+Kamu adalah backend developer untuk Oura Studio. Stack: Supabase (PostgreSQL), Python/FastAPI.
+
+v3.18 mengatasi bug kritis: iOS tidak bisa catat penjualan untuk produk yang stoknya diinput manual
+(lewat adjustStock / stok awal), karena POST /sales-orders mengembalikan error:
+
+  "No HPP recorded yet for product_size_id {id} — cannot compute profit"
+
+Error ini muncul karena backend hanya tahu cara ambil HPP dari production_batch_item terkonfirmasi.
+Produk dengan stok manual tidak punya batch, sehingga penjualan diblokir total.
+
+Keputusan (Opsi A): tambahkan fallback HPP dari PatternSpec, bukan blokir penjualan.
+
+
+ROOT CAUSE
+==========
+
+Di handler POST /sales-orders (atau di helper yang dipanggil saat create), ada logika seperti:
+
+  # Pseudocode existing behavior
+  batch_item = get_latest_confirmed_batch_item(product_size_id)
+  if batch_item is None:
+      raise HTTPException(400, "No HPP recorded yet for product_size_id ...")
+  unit_hpp = batch_item.hpp_total
+
+Ini harus diubah menjadi tiga-tier fallback.
+
+
+TUGAS
+=====
+
+Ubah logika HPP lookup di POST /sales-orders menjadi tiga-tier fallback:
+
+  Tier 1 — Batch HPP (existing, prioritas tertinggi):
+    Cari production_batch_item terkonfirmasi terbaru untuk product_size_id.
+    Gunakan hpp_total dari batch item tersebut.
+    hpp_source = "batch"
+
+  Tier 2 — PatternSpec estimated HPP (baru):
+    Jika tidak ada batch, cari PatternSpec aktif terbaru untuk product_size_id.
+    Hitung estimated HPP dari:
+      fabric_cost  = SUM per fabric: cut_length_cm × cut_width_cm × material.current_avg_cost
+      hardware_cost = SUM per component: qty_per_unit × material.current_avg_cost
+      labor_cost   = est_labor_minutes × settings['labor_rate_per_minute']
+      overhead_cost = settings['overhead_rate_per_unit']   (atau 'overhead_per_unit')
+      pooled_cost  = settings['pooled_material_rate:benang']  (jika ada dan nonzero)
+      hpp_total = fabric_cost + hardware_cost + labor_cost + overhead_cost + pooled_cost
+    hpp_source = "pattern_spec"
+
+  Tier 3 — Zero HPP (produk tanpa resep, terakhir):
+    Jika tidak ada PatternSpec aktif, gunakan hpp_total = 0.
+    hpp_source = "manual"
+    JANGAN blokir penjualan — ini boleh terjadi (produk yang diinput sangat awal, sebelum ada resep).
+
+
+DETAIL PERHITUNGAN TIER 2
+==========================
+
+Nama tabel yang digunakan (sesuaikan dengan schema project):
+
+  pattern_spec        : id, product_size_id, est_labor_minutes, is_active
+  pattern_spec_fabric : id, pattern_spec_id, material_id, cut_length_cm, cut_width_cm
+  pattern_spec_component: id, pattern_spec_id, material_id, qty_per_unit
+  material            : id, current_avg_cost   (float, cost per cm² untuk kain; cost per pcs untuk hardware)
+  app_setting         : key (varchar), value (text → cast float)
+
+Query untuk ambil PatternSpec terbaru:
+  SELECT * FROM pattern_spec
+  WHERE product_size_id = :product_size_id AND is_active = true
+  ORDER BY created_at DESC
+  LIMIT 1
+
+Query untuk fabric cost:
+  SELECT psf.cut_length_cm, psf.cut_width_cm, m.current_avg_cost
+  FROM pattern_spec_fabric psf
+  JOIN material m ON m.id = psf.material_id
+  WHERE psf.pattern_spec_id = :spec_id
+
+  fabric_cost = sum(row.cut_length_cm * row.cut_width_cm * row.current_avg_cost)
+
+Query untuk hardware cost:
+  SELECT psc.qty_per_unit, m.current_avg_cost
+  FROM pattern_spec_component psc
+  JOIN material m ON m.id = psc.material_id
+  WHERE psc.pattern_spec_id = :spec_id
+
+  hardware_cost = sum(row.qty_per_unit * row.current_avg_cost)
+
+Settings keys (sesuaikan dengan yang sudah ada di app_setting):
+  labor_rate_per_minute   : rate Rp per menit kerja
+  overhead_rate_per_unit  : Rp overhead per unit (bisa juga bernama 'overhead_per_unit')
+  pooled_material_rate:benang : Rp benang per unit (opsional, gunakan 0 jika key tidak ada)
+
+Jika ada setting key yang belum ada di database, default ke 0.0.
+
+
+PERUBAHAN SCHEMA: sales_order_item
+====================================
+
+Tambahkan satu kolom baru (nullable, backward-compat):
+
+  ALTER TABLE sales_order_item
+    ADD COLUMN IF NOT EXISTS hpp_source VARCHAR(20) DEFAULT 'batch';
+
+Nilai yang valid: 'batch', 'pattern_spec', 'manual'
+Default 'batch' agar baris lama (yang memang dari batch) otomatis terisi benar.
+
+Update Pydantic model SalesOrderItemOut (tambahkan field):
+  hpp_source: str = "batch"
+
+
+PERUBAHAN RESPONSE: POST /sales-orders
+=======================================
+
+Tidak ada perubahan pada response shape yang digunakan iOS — unit_hpp_snapshot tetap ada dan
+berisi nilai HPP (sekarang bisa dari batch atau estimasi PatternSpec atau 0).
+
+hpp_source di-include di response item jika memungkinkan, tapi tidak wajib untuk MVP:
+  "hpp_source": "pattern_spec"   // atau "batch" atau "manual"
+
+iOS sudah display warning banner jika produk tanpa HPP batch — tidak perlu perubahan frontend.
+
+
+PENTING: JANGAN ubah logika ini
+================================
+
+1. Jangan sentuh confirmed production_batch_item — HPP di sana locked forever (rule #6 dev-backend skill).
+2. Jangan hapus atau edit existing sales_order_item setelah dibuat.
+3. Fallback ini HANYA untuk HPP snapshot di saat penjualan — tidak retroaktif mengubah HPP produk.
+4. current_avg_cost di material harus tetap dihitung dari MaterialPurchase (weighted average) — jangan ubah.
+
+
+URUTAN IMPLEMENTASI
+===================
+
+1. Migration: ADD COLUMN hpp_source di sales_order_item (DDL di atas)
+2. Buat helper function: get_hpp_for_sale(product_size_id, db) → (float, str)
+   - Implement tiga-tier logic
+   - Return (hpp_total, hpp_source)
+3. Update handler POST /sales-orders:
+   - Panggil get_hpp_for_sale() untuk setiap item request
+   - Ganti hardcoded "raise HTTPException" dengan nilai dari helper
+   - Simpan hpp_source ke kolom baru
+4. Update SalesOrderItemOut Pydantic model: tambah hpp_source field
+5. Test dengan:
+   a. Produk dengan batch confirmed → tier 1, hpp_source = "batch"
+   b. Produk dengan PatternSpec tapi tanpa batch → tier 2, hpp_source = "pattern_spec", hpp > 0
+   c. Produk tanpa PatternSpec dan tanpa batch → tier 3, hpp_source = "manual", hpp = 0
+
+TIDAK ADA perubahan endpoint lain. Tidak ada migration lain. Tidak ada perubahan di GET endpoints.
+
+
+VERIFIKASI AKHIR
+================
+
+curl -X POST /sales-orders \
+  -H "Authorization: Bearer {token}" \
+  -d '{"items": [{"product_size_id": "{manual_stock_id}", "qty": 1, "unit_price": 25000}]}'
+
+→ Harus return 200/201 (bukan 400)
+→ unit_hpp_snapshot boleh 0 atau estimasi dari pattern spec
+→ hpp_source harus "pattern_spec" atau "manual" (bukan "batch")
+
+curl -X POST /sales-orders \
+  -d '{"items": [{"product_size_id": "{batch_product_id}", "qty": 1, "unit_price": 25000}]}'
+
+→ Harus return 200/201 dengan unit_hpp_snapshot dari batch (tidak berubah dari sebelumnya)
+→ hpp_source = "batch"

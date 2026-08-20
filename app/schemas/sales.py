@@ -28,6 +28,7 @@ class SalesOrderItemOut(BaseModel):
     unit_price: float
     discount: float
     unit_hpp_snapshot: float
+    hpp_source: str = "batch"
     line_profit: float
     line_revenue: float
 
