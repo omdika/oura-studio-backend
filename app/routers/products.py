@@ -69,7 +69,9 @@ def _get_size_or_404(db: Session, product: Product, size_id: uuid.UUID) -> Produ
 
 def _generate_unique_sku(db: Session, name: str) -> str:
     # Section 2 spec: SKU auto-fills as an UPPERCASE slug (e.g. "Pouch Serut" -> "POUCH-SERUT").
-    base = slugify(name, uppercase=True) or "PRODUCT"
+    # python-slugify 8.0.4 has no `uppercase` kwarg (renamed to `lowercase`, default True) --
+    # slugify() always normalizes to lowercase, so uppercase it after instead.
+    base = slugify(name).upper() or "PRODUCT"
     sku = base
     suffix = 2
     while db.query(Product).filter(Product.sku == sku).first() is not None:
