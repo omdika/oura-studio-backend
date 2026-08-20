@@ -1,0 +1,226 @@
+IMPLEMENT v3.19 — Manual HPP Override + Enhanced Stock Input
+=============================================================
+
+Tujuan: Produk yang tidak melewati alur Optimasi Pola → Batch Produksi → Konfirmasi
+tidak memiliki HPP, sehingga Price Advisor tidak bisa digunakan dan profit di laporan
+tidak terhitung. v3.19 menambahkan kemampuan input HPP manual per komponen yang disimpan
+di product_sizes dan digunakan sebagai fallback di seluruh sistem.
+
+Konteks codebase:
+- Backend: FastAPI + SQLAlchemy + Alembic (Supabase/PostgreSQL)
+- Tabel utama: product_sizes, stock_ledger, pattern_specs, material_usage_log
+- PATCH /products/{sku}/sizes/{size_id} sudah ada — perlu di-extend
+- GET /products/{sku}/sizes sudah ada — perlu tambah 5 field baru di response
+- addStockFromBahan (POST /products/{sku}/sizes/{size_id}/stock-from-bahan) sudah ada
+
+Baca handoff.md dan doc/versions/ untuk konteks domain.
+
+---
+
+## TASK 1: Migration — Tambah kolom manual HPP ke product_sizes
+
+Buat Alembic migration baru. Tambahkan 5 kolom nullable ke tabel `product_sizes`:
+
+```sql
+ALTER TABLE product_sizes
+  ADD COLUMN manual_hpp_fabric    NUMERIC(14, 4),
+  ADD COLUMN manual_hpp_pooled    NUMERIC(14, 4),
+  ADD COLUMN manual_hpp_hardware  NUMERIC(14, 4),
+  ADD COLUMN manual_hpp_labor     NUMERIC(14, 4),
+  ADD COLUMN manual_hpp_overhead  NUMERIC(14, 4);
+```
+
+Semua nullable, tanpa default, tanpa constraint. Nilai 0 dan NULL keduanya valid —
+NULL berarti "belum pernah diset", 0 berarti "diset ke nol secara eksplisit".
+
+---
+
+## TASK 2: Model SQLAlchemy — Update ProductSize
+
+Di model ProductSize (atau ProductSizeDetail), tambahkan 5 kolom baru sesuai migration.
+
+Tambahkan juga computed property atau hybrid property (jika digunakan di query):
+
+```python
+@property
+def manual_hpp_total(self) -> float:
+    return (
+        (self.manual_hpp_fabric or 0)
+        + (self.manual_hpp_pooled or 0)
+        + (self.manual_hpp_hardware or 0)
+        + (self.manual_hpp_labor or 0)
+        + (self.manual_hpp_overhead or 0)
+    )
+
+@property
+def has_manual_hpp(self) -> bool:
+    return self.manual_hpp_total > 0
+```
+
+---
+
+## TASK 3: Pydantic Schema — Update ProductSizeResponse
+
+Di schema response ProductSizeDetail / ProductSizeResponse, tambahkan:
+
+```python
+manual_hpp_fabric:    Optional[float] = None
+manual_hpp_pooled:    Optional[float] = None
+manual_hpp_hardware:  Optional[float] = None
+manual_hpp_labor:     Optional[float] = None
+manual_hpp_overhead:  Optional[float] = None
+manual_hpp_total:     Optional[float] = None   # computed, selalu di-return
+```
+
+`manual_hpp_total` di-compute dari 5 kolom sebelum direturn. Return 0 jika semua None,
+bukan None — frontend menggunakannya sebagai angka.
+
+---
+
+## TASK 4: Pydantic Schema — Update PatchProductSizeRequest
+
+Endpoint PATCH /products/{sku}/sizes/{size_id} sudah menerima `selling_price` dan
+`reorder_min_qty`. Tambahkan 5 field opsional baru:
+
+```python
+class PatchProductSizeRequest(BaseModel):
+    selling_price:       Optional[float] = None
+    reorder_min_qty:     Optional[float] = None
+    # NEW:
+    manual_hpp_fabric:   Optional[float] = None
+    manual_hpp_pooled:   Optional[float] = None
+    manual_hpp_hardware: Optional[float] = None
+    manual_hpp_labor:    Optional[float] = None
+    manual_hpp_overhead: Optional[float] = None
+```
+
+---
+
+## TASK 5: Endpoint — PATCH /products/{sku}/sizes/{size_id}
+
+Update handler untuk menyimpan 5 field baru jika dikirimkan:
+
+```python
+if body.manual_hpp_fabric is not None:
+    size.manual_hpp_fabric = body.manual_hpp_fabric
+if body.manual_hpp_pooled is not None:
+    size.manual_hpp_pooled = body.manual_hpp_pooled
+if body.manual_hpp_hardware is not None:
+    size.manual_hpp_hardware = body.manual_hpp_hardware
+if body.manual_hpp_labor is not None:
+    size.manual_hpp_labor = body.manual_hpp_labor
+if body.manual_hpp_overhead is not None:
+    size.manual_hpp_overhead = body.manual_hpp_overhead
+```
+
+Pola: hanya update field yang dikirimkan (tidak None). Jika frontend mengirim null
+untuk suatu field, artinya "jangan ubah nilai existing" — bukan "reset ke null".
+Ini konsisten dengan PATCH semantics yang sudah ada.
+
+---
+
+## TASK 6: Endpoint — GET /products/{sku}/sizes (dan GET tunggal)
+
+Pastikan response menyertakan 5 kolom manual HPP baru. Jika ORM sudah di-map
+dengan benar di Task 3, ini otomatis terjadi. Cek dengan:
+
+```
+GET /products/{sku}/sizes
+```
+
+Verify response tiap size object punya key `manual_hpp_fabric` dst.
+
+---
+
+## TASK 7: Fallback HPP di Sales Order
+
+Endpoint POST /sales-orders mengambil HPP dari `production_batch_item` terkonfirmasi
+(sudah ada fallback ke PatternSpec dari v3.18). Tambahkan level fallback ketiga:
+jika tidak ada batch HPP DAN tidak ada PatternSpec estimasi, coba ambil dari
+`manual_hpp_*` di product_sizes:
+
+```python
+# Urutan priority HPP:
+# 1. Batch produksi terkonfirmasi (existing)
+# 2. PatternSpec aktif — estimasi (v3.18)
+# 3. Manual HPP dari product_sizes (v3.19 — NEW)
+# 4. hpp_total = 0, hpp_source = "none"
+
+if not hpp_found and size.has_manual_hpp:
+    hpp_total    = size.manual_hpp_total
+    hpp_fabric   = size.manual_hpp_fabric or 0
+    hpp_pooled   = size.manual_hpp_pooled or 0
+    hpp_hardware = size.manual_hpp_hardware or 0
+    hpp_labor    = size.manual_hpp_labor or 0
+    hpp_overhead = size.manual_hpp_overhead or 0
+    hpp_source   = "manual"
+```
+
+Pastikan `hpp_source` field ada di response sales order dan di tabel
+`sales_order_items` jika diperlukan untuk audit. Jika tabel sudah punya kolom ini
+dari v3.18, cukup tambahkan nilai `"manual"` sebagai valid string.
+
+---
+
+## TASK 8: Laporan Penjualan — Pastikan manual HPP terhitung di profit
+
+Jika endpoint GET /reports/sales mengambil profit dari `sales_order_items.hpp_total`,
+dan Task 7 sudah mengisi `hpp_total` dari manual HPP, maka laporan otomatis benar.
+
+Verifikasi: buat test case dengan produk yang hanya punya manual HPP, buat sales order,
+cek apakah `total_profit` di GET /reports/sales tidak 0.
+
+---
+
+## TASK 9: Price Advisor Endpoint (jika dipakai)
+
+Frontend v3.19 menggunakan Price Advisor secara **client-side** (pure math, tidak
+memanggil backend). Jika ada endpoint GET /products/{sku}/sizes/{size_id}/price-advisor,
+pastikan ia juga menggunakan fallback hierarchy dari Task 7 untuk menghitung HPP base.
+
+Jika endpoint ini tidak ada atau tidak dipakai frontend, skip Task ini.
+
+---
+
+## Testing Checklist
+
+Setelah implementasi, verifikasi endpoint-endpoint berikut:
+
+1. `PATCH /products/{sku}/sizes/{id}` dengan payload:
+   ```json
+   {
+     "manual_hpp_fabric": 5000,
+     "manual_hpp_pooled": 400,
+     "manual_hpp_hardware": 1200,
+     "manual_hpp_labor": 3000,
+     "manual_hpp_overhead": 200
+   }
+   ```
+   → Response harus include 5 field + `manual_hpp_total: 9800`
+
+2. `GET /products/{sku}/sizes` setelah PATCH → verify semua size items punya field baru
+
+3. `PATCH` dengan partial fields (hanya `manual_hpp_fabric`) → field lain tidak berubah
+
+4. `POST /sales-orders` untuk produk dengan hanya manual HPP (no batch, no spec) →
+   response harus include `hpp_total > 0` dan `hpp_source: "manual"`
+
+5. `GET /reports/sales` setelah sales order manual-HPP product → `total_profit` tidak 0
+
+---
+
+## File yang Diperkirakan Berubah
+
+- `alembic/versions/{timestamp}_add_manual_hpp_to_product_sizes.py` (NEW)
+- `app/models/product.py` (atau nama model ProductSize)
+- `app/schemas/product.py` (ProductSizeResponse, PatchProductSizeRequest)
+- `app/routers/products.py` (PATCH handler, GET handler)
+- `app/routers/sales.py` atau `app/services/sales_service.py` (HPP fallback)
+- `app/routers/reports.py` (jika perlu, biasanya otomatis via sales_order_items)
+
+---
+
+Referensi:
+- Frontend spec: frontend/oura studio frontend/doc/versions/v3.19.md
+- Implement v3.18 (HPP fallback level 2): doc/implement-v3.18-hpp-fallback.txt
+- Handoff domain context: handoff.md sections HPP calculation, ProductSize entity
