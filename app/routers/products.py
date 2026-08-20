@@ -33,6 +33,7 @@ from app.schemas.product import (
     ProductUpdate,
     PurchaseConsumedOut,
 )
+from app.routers.sales import get_hpp_for_sale
 from app.services.pricing import compute_margin_pct, compute_markup_pct, compute_suggested_price
 
 router = APIRouter(tags=["products"], dependencies=[Depends(get_current_owner)])
@@ -268,6 +269,12 @@ def _size_fields(size: ProductSize) -> dict:
         "reorder_min_qty": size.reorder_min_qty,
         "selling_price": size.selling_price,
         "is_archived": size.is_archived,
+        "manual_hpp_fabric": size.manual_hpp_fabric,
+        "manual_hpp_pooled": size.manual_hpp_pooled,
+        "manual_hpp_hardware": size.manual_hpp_hardware,
+        "manual_hpp_labor": size.manual_hpp_labor,
+        "manual_hpp_overhead": size.manual_hpp_overhead,
+        "manual_hpp_total": size.manual_hpp_total,
     }
 
 
@@ -513,6 +520,16 @@ def update_product_size(sku: str, size_id: uuid.UUID, body: ProductSizeUpdate, d
         size.selling_price = body.selling_price
     if body.reorder_min_qty is not None:
         size.reorder_min_qty = body.reorder_min_qty
+    if body.manual_hpp_fabric is not None:
+        size.manual_hpp_fabric = body.manual_hpp_fabric
+    if body.manual_hpp_pooled is not None:
+        size.manual_hpp_pooled = body.manual_hpp_pooled
+    if body.manual_hpp_hardware is not None:
+        size.manual_hpp_hardware = body.manual_hpp_hardware
+    if body.manual_hpp_labor is not None:
+        size.manual_hpp_labor = body.manual_hpp_labor
+    if body.manual_hpp_overhead is not None:
+        size.manual_hpp_overhead = body.manual_hpp_overhead
     _apply_is_archived(size, body.is_archived)
 
     db.commit()
@@ -541,8 +558,12 @@ def price_advisor(sku: str, size_id: uuid.UUID, body: PriceAdvisorRequest, db: S
     product = _get_product_or_404(db, sku)
     size = _get_size_or_404(db, product, size_id)
 
-    latest_item = _latest_production_item(db, size.id)
-    if latest_item is None:
+    # v3.19: reuses the same batch -> pattern_spec -> manual -> none fallback as POST
+    # /sales-orders (get_hpp_for_sale) instead of only looking at confirmed production batches --
+    # a size priced from a manual HPP override or an estimated PatternSpec can now get a
+    # suggestion too. Only reject when hpp_source="none" -- genuinely no cost basis at all.
+    hpp_total, hpp_source = get_hpp_for_sale(db, size.id)
+    if hpp_source == "none":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No production HPP recorded yet for this product size",
@@ -550,15 +571,15 @@ def price_advisor(sku: str, size_id: uuid.UUID, body: PriceAdvisorRequest, db: S
 
     try:
         suggested_price = compute_suggested_price(
-            latest_item.hpp_total, body.target_margin_pct, body.marketplace_fee_pct, body.promo_allocation_pct
+            hpp_total, body.target_margin_pct, body.marketplace_fee_pct, body.promo_allocation_pct
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     return PriceAdvisorResponse(
         suggested_price=suggested_price,
-        resulting_margin_pct=compute_margin_pct(suggested_price, latest_item.hpp_total),
-        resulting_markup_pct=compute_markup_pct(suggested_price, latest_item.hpp_total),
+        resulting_margin_pct=compute_margin_pct(suggested_price, hpp_total),
+        resulting_markup_pct=compute_markup_pct(suggested_price, hpp_total),
     )
 
 

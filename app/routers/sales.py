@@ -107,9 +107,20 @@ def _current_stock_qty(db: Session, product_size_id: uuid.UUID) -> int:
 
 
 def _latest_hpp_snapshot(db: Session, product_size_id: uuid.UUID) -> float | None:
+    # Bug fix (found while implementing v3.19): must filter reason='production' -- without it,
+    # this picks up the unit_hpp_snapshot this same function wrote onto the *previous* sale's own
+    # stock_ledger row (POST /sales-orders writes one on every sale, reason='sale', even when the
+    # HPP fallback used was tier 2/3/4 and the snapshot is 0 or an estimate). That made Tier 1
+    # wrongly "lock in" whatever the last sale used -- including a stale/zero value -- and
+    # permanently short-circuit tiers 2-4 (pattern_spec/manual/none) for every sale after the
+    # first one, since 0.0 is `is not None`. Only a batch confirm should ever satisfy Tier 1.
     row = (
         db.query(StockLedger)
-        .filter(StockLedger.product_size_id == product_size_id, StockLedger.unit_hpp_snapshot.isnot(None))
+        .filter(
+            StockLedger.product_size_id == product_size_id,
+            StockLedger.reason == "production",
+            StockLedger.unit_hpp_snapshot.isnot(None),
+        )
         .order_by(StockLedger.created_at.desc())
         .first()
     )
@@ -152,16 +163,20 @@ def _latest_active_pattern_spec(db: Session, product_size_id: uuid.UUID) -> Patt
 
 
 def get_hpp_for_sale(db: Session, product_size_id: uuid.UUID) -> tuple[float, str]:
-    """v3.18 -- three-tier HPP fallback so a sale is never blocked just because stock was entered
-    manually (adjustStock / stok awal) rather than through a confirmed production batch.
+    """v3.18/v3.19 -- four-tier HPP fallback so a sale is never blocked just because stock was
+    entered manually (adjustStock / stok awal) rather than through a confirmed production batch.
 
     Tier 1: latest confirmed production_batch_item HPP, via stock_ledger's snapshot (existing
             behavior, unchanged) -- hpp_source = "batch".
     Tier 2: no batch yet, but an active PatternSpec exists -- estimate HPP from its fabric/hardware/
             labor/overhead, same formula as batch confirm (services/hpp.compute_hpp) -- hpp_source
             = "pattern_spec".
-    Tier 3: no batch, no active PatternSpec (product entered before any resep existed) -- hpp=0,
-            sale still allowed -- hpp_source = "manual".
+    Tier 3 (v3.19): no batch, no active PatternSpec, but product_size has a manual HPP override
+            (manual_hpp_* columns, sum > 0) -- hpp_source = "manual".
+    Tier 4: none of the above -- hpp=0, sale still allowed -- hpp_source = "none". This was
+            hpp_source="manual" in v3.18; renamed because v3.19 needed "manual" to mean an actual
+            owner-entered override, not "no cost data available". Existing sales_order_item rows
+            written before this change keep hpp_source="manual" with hpp=0 from that older meaning.
     """
     batch_hpp = _latest_hpp_snapshot(db, product_size_id)
     if batch_hpp is not None:
@@ -196,7 +211,11 @@ def get_hpp_for_sale(db: Session, product_size_id: uuid.UUID) -> tuple[float, st
         )
         return breakdown.hpp_total, "pattern_spec"
 
-    return 0.0, "manual"
+    size = db.get(ProductSize, product_size_id)
+    if size is not None and size.has_manual_hpp:
+        return size.manual_hpp_total, "manual"
+
+    return 0.0, "none"
 
 
 def _generate_invoice_no(db: Session) -> str:

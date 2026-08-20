@@ -34,6 +34,13 @@ class ProductSizeUpdate(BaseModel):
     selling_price: float | None = None
     reorder_min_qty: float | None = None
     is_archived: bool | None = None
+    # v3.19: manual HPP override, per component. PATCH semantics: omitted (None) = leave existing
+    # value unchanged, not "reset to null" -- consistent with selling_price/reorder_min_qty above.
+    manual_hpp_fabric: float | None = None
+    manual_hpp_pooled: float | None = None
+    manual_hpp_hardware: float | None = None
+    manual_hpp_labor: float | None = None
+    manual_hpp_overhead: float | None = None
 
 
 class ProductSizeOut(BaseModel):
@@ -49,6 +56,14 @@ class ProductSizeOut(BaseModel):
     current_stock_qty: int
     production_stock_qty: int  # sum of stock_ledger.change_qty where reason='production' (added v2.10)
     manual_stock_qty: int  # sum of stock_ledger.change_qty where reason IN ('initial','adjustment') (added v2.10)
+    # v3.19: manual HPP override, per component. manual_hpp_total is always a number (0 if every
+    # component is unset), never null -- frontend treats it as a number directly.
+    manual_hpp_fabric: float | None = None
+    manual_hpp_pooled: float | None = None
+    manual_hpp_hardware: float | None = None
+    manual_hpp_labor: float | None = None
+    manual_hpp_overhead: float | None = None
+    manual_hpp_total: float = 0
 
 
 class HppLineItemOut(BaseModel):

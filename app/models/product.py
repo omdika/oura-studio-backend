@@ -36,5 +36,27 @@ class ProductSize(Base):
     # GET .../sizes/{size} response: selling_price) requires a column to persist it; the literal DDL omitted it.
     selling_price: Mapped[float | None] = mapped_column(Numeric(asdecimal=False), nullable=True)
     is_archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # v3.19: manual HPP override, per component -- fallback tier 3 in get_hpp_for_sale (routers/sales.py)
+    # for sizes that never went through a confirmed ProductionBatch or have an active PatternSpec.
+    # NULL means "never set"; 0 means "explicitly set to zero" -- both are distinct from "unset".
+    manual_hpp_fabric: Mapped[float | None] = mapped_column(Numeric(14, 4, asdecimal=False), nullable=True)
+    manual_hpp_pooled: Mapped[float | None] = mapped_column(Numeric(14, 4, asdecimal=False), nullable=True)
+    manual_hpp_hardware: Mapped[float | None] = mapped_column(Numeric(14, 4, asdecimal=False), nullable=True)
+    manual_hpp_labor: Mapped[float | None] = mapped_column(Numeric(14, 4, asdecimal=False), nullable=True)
+    manual_hpp_overhead: Mapped[float | None] = mapped_column(Numeric(14, 4, asdecimal=False), nullable=True)
 
     product: Mapped["Product"] = relationship(back_populates="sizes")
+
+    @property
+    def manual_hpp_total(self) -> float:
+        return (
+            (self.manual_hpp_fabric or 0)
+            + (self.manual_hpp_pooled or 0)
+            + (self.manual_hpp_hardware or 0)
+            + (self.manual_hpp_labor or 0)
+            + (self.manual_hpp_overhead or 0)
+        )
+
+    @property
+    def has_manual_hpp(self) -> bool:
+        return self.manual_hpp_total > 0
