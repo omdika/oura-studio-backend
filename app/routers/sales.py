@@ -168,19 +168,35 @@ def get_hpp_for_sale(db: Session, product_size_id: uuid.UUID) -> tuple[float, st
 
     Tier 1: latest confirmed production_batch_item HPP, via stock_ledger's snapshot (existing
             behavior, unchanged) -- hpp_source = "batch".
-    Tier 2: no batch yet, but an active PatternSpec exists -- estimate HPP from its fabric/hardware/
-            labor/overhead, same formula as batch confirm (services/hpp.compute_hpp) -- hpp_source
-            = "pattern_spec".
-    Tier 3 (v3.19): no batch, no active PatternSpec, but product_size has a manual HPP override
-            (manual_hpp_* columns, sum > 0) -- hpp_source = "manual".
+    Tier 2 (reordered, see bug note below): product_size has a manual HPP override (manual_hpp_*
+            columns, sum > 0) -- hpp_source = "manual".
+    Tier 3: no batch, no manual override, but an active PatternSpec exists -- estimate HPP from
+            its fabric/hardware/labor/overhead, same formula as batch confirm
+            (services/hpp.compute_hpp) -- hpp_source = "pattern_spec".
     Tier 4: none of the above -- hpp=0, sale still allowed -- hpp_source = "none". This was
             hpp_source="manual" in v3.18; renamed because v3.19 needed "manual" to mean an actual
             owner-entered override, not "no cost data available". Existing sales_order_item rows
             written before this change keep hpp_source="manual" with hpp=0 from that older meaning.
+
+    Bug fix: manual was originally tier 3 (below pattern_spec), per doc/implement-v3.19-manual-
+    hpp-stock.txt's literal ordering. In practice this made manual overrides dead code for any
+    size entered via the QR "Dari Produksi" flow (POST .../stock-from-bahan), since that flow
+    *requires* an active PatternSpec (spec_id) to run at all -- so tier "pattern_spec" always won
+    before manual was ever checked. Confirmed live: a scrunchie material with no fabric_width_cm
+    on record made the pattern_spec estimate compute fabric cost as cost_per_cm * cut_height_cm
+    (whole-roll-width fallback in estimate_fabric_cost_per_piece_from_rate) = Rp 9,062.5/piece,
+    vs. the owner's manual entry of Rp 90.625/piece -- a ~100x inflation that pushed hpp_total
+    (Rp 12,572.5) above realistic selling prices, producing negative margin in the sales report.
+    An explicit owner-entered override should win over an automated estimate, so manual now runs
+    before pattern_spec.
     """
     batch_hpp = _latest_hpp_snapshot(db, product_size_id)
     if batch_hpp is not None:
         return batch_hpp, "batch"
+
+    size = db.get(ProductSize, product_size_id)
+    if size is not None and size.has_manual_hpp:
+        return size.manual_hpp_total, "manual"
 
     spec = _latest_active_pattern_spec(db, product_size_id)
     if spec is not None:
@@ -210,10 +226,6 @@ def get_hpp_for_sale(db: Session, product_size_id: uuid.UUID) -> tuple[float, st
             overhead_per_unit=overhead,
         )
         return breakdown.hpp_total, "pattern_spec"
-
-    size = db.get(ProductSize, product_size_id)
-    if size is not None and size.has_manual_hpp:
-        return size.manual_hpp_total, "manual"
 
     return 0.0, "none"
 
