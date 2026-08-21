@@ -1,0 +1,167 @@
+IMPLEMENT v3.19 — Backend Session
+===================================
+
+Frontend v3.19 sudah selesai dan sudah ditest di device. Ada dua masalah
+yang ditemukan saat testing dan perlu diselesaikan di backend:
+
+1. PATCH /products/{sku}/sizes/{size_id} belum menerima 5 field manual HPP
+   → saat frontend simpan HPP, data tidak tersimpan ke DB (PATCH ada tapi field baru belum)
+
+2. POST /products/{sku}/sizes/{size_id}/stock-from-bahan mengembalikan 404
+   → frontend fallback ke adjustStock, bahan tidak dikurangi
+
+Baca dulu: backend/doc/implement-v3.19-manual-hpp-stock.txt untuk spec lengkap.
+Baca juga: frontend/oura studio frontend/doc/versions/v3.19.md untuk konteks UX.
+
+---
+
+## PRIORITAS IMPLEMENTASI
+
+### PRIORITY 1 — Manual HPP tersimpan (Tasks 1–6)
+
+Ini blocking. Saat user tap Simpan di ScanToStockSheet, frontend mengirim:
+
+  PATCH /products/{sku}/sizes/{size_id}
+  Body: {
+    "selling_price": 6398,          // opsional — hanya jika user tap "Gunakan Harga Ini"
+    "manual_hpp_fabric": 125.0,
+    "manual_hpp_pooled": 200.0,
+    "manual_hpp_hardware": 313.0,
+    "manual_hpp_labor": 3000.0,
+    "manual_hpp_overhead": 200.0
+  }
+
+Frontend menggunakan `try?` untuk PATCH ini (fire-and-forget setelah stok masuk),
+jadi error tidak kelihatan ke user — tapi data tidak tersimpan.
+
+Lakukan Tasks 1–6 dari implement-v3.19-manual-hpp-stock.txt:
+  Task 1: Alembic migration — tambah 5 kolom nullable ke product_sizes
+  Task 2: Update SQLAlchemy model ProductSize
+  Task 3: Update Pydantic ProductSizeResponse — tambah 5 field + manual_hpp_total
+  Task 4: Update PatchProductSizeRequest — terima 5 field opsional
+  Task 5: Update handler PATCH /products/{sku}/sizes/{size_id}
+  Task 6: Verifikasi GET /products/{sku}/sizes include 5 field baru
+
+Setelah Task 1–6, verifikasi:
+  curl -X PATCH .../products/{sku}/sizes/{id} \
+    -H "Authorization: Bearer ..." \
+    -d '{"manual_hpp_fabric": 5000, "manual_hpp_labor": 3000}'
+  → response harus include manual_hpp_fabric: 5000, manual_hpp_total: 8000
+
+---
+
+### PRIORITY 2 — Investigasi addStockFromBahan 404
+
+Endpoint: POST /products/{sku}/sizes/{size_id}/stock-from-bahan
+Body yang dikirim frontend:
+  { "qty": 1, "spec_id": "<uuid>" }
+
+Endpoint ini sudah ada dari versi sebelumnya, tapi testing v3.19 mengembalikan 404.
+
+Kemungkinan penyebab:
+  a) URL path di backend tidak match — cek apakah endpoint terdaftar di router
+  b) Handler melakukan lookup spec berdasarkan spec_id tapi tidak menemukan record
+     (spec_id dari frontend sudah benar karena diambil dari GET /pattern-specs)
+  c) Handler memvalidasi bahwa spec.product_size_id == size_id di URL — jika
+     produk tidak punya fabric_variant_name, product_size_id mungkin berbeda dari
+     yang dipakai URL
+
+Langkah debugging:
+  1. Cari handler untuk path "stock-from-bahan" di routers/
+  2. Print/log spec_id yang diterima dan cek apakah spec ada di DB
+  3. Cek apakah ada kondisi 404 eksplisit di handler (misal: size.product_sku != sku)
+  4. Test manual dengan curl menggunakan spec_id yang valid
+
+Jika fix mudah (routing issue / typo), fix di session ini.
+Jika kompleks, dokumentasikan root cause di bagian bawah file ini.
+
+---
+
+### PRIORITY 3 — HPP Fallback di Sales Order (Task 7)
+
+Saat POST /sales-orders untuk produk yang hanya punya manual HPP:
+  - hpp_total di sales_order_items harus diambil dari manual_hpp_* (bukan 0)
+  - hpp_source = "manual"
+
+Urutan prioritas HPP yang sudah ada:
+  1. Batch produksi terkonfirmasi (hpp_source = "batch")
+  2. PatternSpec aktif — estimasi (hpp_source = "spec") ← dari v3.18
+  3. Manual HPP dari product_sizes (hpp_source = "manual") ← BARU v3.19
+  4. hpp_total = 0, hpp_source = "none"
+
+Cek kode di sales service/router untuk fallback chain ini, tambahkan level 3.
+
+---
+
+### PRIORITY 4 — Laporan Profit (Task 8)
+
+Jika Task 7 sudah mengisi hpp_total dengan benar di sales_order_items,
+laporan profit biasanya otomatis benar (karena query laporan JOIN sales_order_items).
+
+Verifikasi:
+  1. Buat sales order untuk produk dengan hanya manual HPP
+  2. GET /reports/sales — cek total_profit tidak 0
+
+---
+
+## PAYLOAD YANG DIKIRIM FRONTEND (referensi)
+
+### PATCH product_size
+PatchProductSizeRequest Swift struct:
+  selling_price      : Double?   // opsional
+  reorder_min_qty    : Double?   // opsional
+  is_archived        : Bool?     // opsional
+  manual_hpp_fabric  : Double?   // opsional — NULL = "tidak diubah"
+  manual_hpp_pooled  : Double?
+  manual_hpp_hardware: Double?
+  manual_hpp_labor   : Double?
+  manual_hpp_overhead: Double?
+
+Semantik PATCH: hanya field yang non-null yang di-update.
+Jika frontend tidak kirim manual_hpp_fabric (null), nilai existing di DB tidak berubah.
+
+### ProductSizeDetail yang di-expect frontend
+Setelah PATCH atau GET, frontend expect response include:
+  id, product_id, product_sku, product_name, size_label,
+  fabric_variant_name, reorder_min_qty, is_archived,
+  current_stock_qty, production_stock_qty, manual_stock_qty,
+  latest_hpp_breakdown, selling_price, margin_pct,
+  manual_hpp_fabric,    ← BARU
+  manual_hpp_pooled,    ← BARU
+  manual_hpp_hardware,  ← BARU
+  manual_hpp_labor,     ← BARU
+  manual_hpp_overhead   ← BARU
+
+(manual_hpp_total tidak dipakai frontend — dihitung client-side)
+
+---
+
+## TESTING CHECKLIST
+
+Setelah implementasi:
+
+[ ] PATCH /products/{sku}/sizes/{id}
+    dengan body { manual_hpp_fabric: 5000, manual_hpp_labor: 3000 }
+    → response.manual_hpp_fabric == 5000, response.manual_hpp_labor == 3000
+
+[ ] PATCH dengan partial (hanya manual_hpp_fabric)
+    → field lain di DB tidak berubah
+
+[ ] GET /products/{sku}/sizes
+    → semua size objects punya 5 field manual_hpp_* (null jika belum diset)
+
+[ ] POST /products/{sku}/sizes/{id}/stock-from-bahan
+    dengan body { qty: 1, spec_id: "<valid uuid>" }
+    → 200 OK (bukan 404)
+
+[ ] POST /sales-orders untuk produk manual-HPP-only
+    → response include hpp_total > 0, hpp_source = "manual"
+
+[ ] GET /reports/sales setelah sales order manual-HPP
+    → total_profit tidak 0
+
+---
+
+File spec detail: backend/doc/implement-v3.19-manual-hpp-stock.txt
+Frontend changes: frontend/oura studio frontend/Screens/QR/ScanToStockSheet.swift
+                  frontend/oura studio frontend/Networking/Models/ProductModels.swift

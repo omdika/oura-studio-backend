@@ -68,3 +68,27 @@ class MaterialPurchase(Base):
 
     material: Mapped["Material"] = relationship(back_populates="purchases")
     supplier: Mapped["Supplier | None"] = relationship()
+
+
+class MaterialUsageLog(Base):
+    """v3.19 bug fix: POST .../stock-from-bahan mutates MaterialPurchase.remaining_length_cm
+    directly (FIFO) but, unlike a confirmed ProductionBatch, leaves no CuttingLayoutItem for
+    routers/materials.py's _fabric_usage_entries() to derive "Pergerakan Stok" history from -- the
+    deduction was real but invisible. This table gives that consumption path its own log;
+    get_material_usage() merges rows from here with the existing CuttingLayoutItem-derived ones.
+    """
+
+    __tablename__ = "material_usage_log"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    material_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("material.id"), nullable=False)
+    material_purchase_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("material_purchase.id"), nullable=True
+    )
+    product_size_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("product_size.id"), nullable=True
+    )
+    deducted_cm: Mapped[float] = mapped_column(Numeric(asdecimal=False), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(String(30), nullable=False)  # "stock_from_bahan" -- only writer today
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

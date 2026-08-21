@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.deps import get_current_owner
 from app.models.cutting import CuttingLayout, CuttingLayoutItem
-from app.models.material import Material, MaterialPurchase
+from app.models.material import Material, MaterialPurchase, MaterialUsageLog
 from app.models.pattern import PatternComponent, PatternSpec
 from app.models.product import Product, ProductSize
 from app.models.production import ProductionBatch, ProductionBatchItem, ProductionBatchLayout
@@ -620,6 +620,12 @@ def add_stock_from_bahan(sku: str, size_id: uuid.UUID, body: AddStockFromBahanRe
           "Stok Awal" version never touched components at all.
       (c) response body changed from a bahan-consumption receipt to the same ProductSizeDetailOut
           shape GET /products/{sku}/sizes returns, per that doc's spec.
+
+    doc/... (bug report, this round): fabric deductions here were invisible in "Pergerakan Stok"
+    (GET /materials/{id}/usage) because that endpoint only ever derived history from
+    CuttingLayoutItem rows belonging to a confirmed ProductionBatch -- this endpoint bypasses that
+    pipeline entirely. Now writes one MaterialUsageLog row per purchase actually deducted from,
+    which routers/materials.py's get_material_usage() merges into the same response.
     """
     product = _get_product_or_404(db, sku)
     size = _get_size_or_404(db, product, size_id)
@@ -668,10 +674,28 @@ def add_stock_from_bahan(sku: str, size_id: uuid.UUID, body: AddStockFromBahanRe
 
     length_needed_cm = body.qty * fabric.cut_height_cm
 
+    description_parts = [size.size_label]
+    if size.fabric_variant_name:
+        description_parts.append(size.fabric_variant_name)
+    usage_description = " · ".join(description_parts)
+
+    def _log_fabric_usage(purchase_id: uuid.UUID, cm_taken: float) -> None:
+        db.add(
+            MaterialUsageLog(
+                material_id=fabric.material_id,
+                material_purchase_id=purchase_id,
+                product_size_id=size.id,
+                deducted_cm=cm_taken,
+                description=usage_description,
+                source="stock_from_bahan",
+            )
+        )
+
     if purchase is not None:
         if (purchase.remaining_length_cm or 0) < length_needed_cm:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Insufficient remaining fabric on this purchase")
         purchase.remaining_length_cm -= length_needed_cm
+        _log_fabric_usage(purchase.id, length_needed_cm)
     else:
         candidates = (
             db.query(MaterialPurchase)
@@ -686,6 +710,7 @@ def add_stock_from_bahan(sku: str, size_id: uuid.UUID, body: AddStockFromBahanRe
             take = min(purchase.remaining_length_cm, remaining_needed)
             purchase.remaining_length_cm -= take
             remaining_needed -= take
+            _log_fabric_usage(purchase.id, take)
         if remaining_needed > 0:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,

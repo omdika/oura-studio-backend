@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.deps import get_current_owner
 from app.models.cutting import CuttingLayout, CuttingLayoutItem
-from app.models.material import Material, MaterialPurchase, Supplier
+from app.models.material import Material, MaterialPurchase, MaterialUsageLog, Supplier
 from app.models.product import Product, ProductSize
 from app.models.production import ProductionBatch, ProductionBatchLayout
 from app.schemas.material import (
@@ -164,6 +164,56 @@ def _fabric_usage_entries(
             )
         )
     return results
+
+
+def _manual_usage_entries(
+    db: Session,
+    material_id: uuid.UUID,
+    from_date: date | None,
+    to_date: date | None,
+    limit: int,
+) -> list[MaterialUsageEntryOut]:
+    """v3.19 bug fix: POST .../stock-from-bahan writes a MaterialUsageLog row per purchase it
+    deducts from (see routers/products.py's add_stock_from_bahan) since it bypasses the
+    CuttingLayoutItem/ProductionBatch pipeline _fabric_usage_entries() above derives history from.
+    get_material_usage() below merges this with that function's results.
+    """
+    query = (
+        db.query(
+            MaterialUsageLog.id,
+            MaterialUsageLog.deducted_cm,
+            MaterialUsageLog.created_at,
+            MaterialUsageLog.description,
+            MaterialUsageLog.product_size_id,
+            Product.sku.label("product_sku"),
+            ProductSize.size_label,
+        )
+        .outerjoin(ProductSize, ProductSize.id == MaterialUsageLog.product_size_id)
+        .outerjoin(Product, Product.id == ProductSize.product_id)
+        .filter(MaterialUsageLog.material_id == material_id)
+        .order_by(MaterialUsageLog.created_at.desc())
+    )
+
+    if from_date:
+        query = query.filter(func.date(MaterialUsageLog.created_at) >= from_date)
+    if to_date:
+        query = query.filter(func.date(MaterialUsageLog.created_at) <= to_date)
+
+    query = query.limit(limit)
+
+    return [
+        MaterialUsageEntryOut(
+            id=row.id,
+            material_id=material_id,
+            deducted_cm=row.deducted_cm,
+            date=row.created_at.date(),
+            description=row.description,
+            product_size_id=row.product_size_id,
+            product_sku=row.product_sku,
+            size_label=row.size_label,
+        )
+        for row in query.all()
+    ]
 
 
 def _normalize_fabric_family(value: str | None) -> str | None:
@@ -326,7 +376,11 @@ def get_material_usage(
     # only mutates remaining_* in place) -- only fabric has a derivable usage history.
     if material.category != "fabric":
         return []
-    return _fabric_usage_entries(db, material_id, from_date, to_date, limit)
+    entries = _fabric_usage_entries(db, material_id, from_date, to_date, limit) + _manual_usage_entries(
+        db, material_id, from_date, to_date, limit
+    )
+    entries.sort(key=lambda e: e.date, reverse=True)
+    return entries[:limit]
 
 
 @router.get("/{material_id}/purchases", response_model=list[MaterialPurchaseOut])

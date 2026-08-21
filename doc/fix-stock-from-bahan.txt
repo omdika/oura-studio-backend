@@ -1,0 +1,191 @@
+FIX: POST /products/{sku}/sizes/{size_id}/stock-from-bahan mengembalikan 404
+==============================================================================
+
+Frontend sudah selesai dan sudah ditest. Endpoint ini dipanggil saat user
+scan QR produk → pilih "Dari Produksi" → toggle "Kurangi bahan otomatis" ON
+→ tap Simpan. Saat ini endpoint mengembalikan 404 sehingga bahan tidak berkurang.
+
+---
+
+## Apa yang harus dilakukan endpoint ini
+
+1. Tambah stok produk (sama seperti POST /products/{sku}/sizes/{size_id}/adjust-stock,
+   dengan reason = "production")
+2. Kurangi stok setiap bahan yang ada di PatternSpec sebanyak:
+   - Untuk setiap fabric di spec.fabrics:
+       deduct_length_cm = fabric.cut_length_cm × qty
+       deduct dari material.remaining_length_cm (atau tabel stock fabric)
+   - Untuk setiap component di spec.components:
+       deduct_qty = component.qty_per_unit × qty
+       deduct dari material.current_stock_qty (atau tabel stock hardware)
+3. Kembalikan ProductSizeBasic (same shape as GET /products/{sku}/sizes single item)
+
+---
+
+## Request
+
+  POST /products/{sku}/sizes/{size_id}/stock-from-bahan
+
+  Headers:
+    Authorization: Bearer <token>
+    Content-Type: application/json
+
+  Body:
+    {
+      "qty": 1,           // int, jumlah pcs yang diproduksi
+      "spec_id": "<uuid>" // UUID PatternSpec yang dipakai
+    }
+
+---
+
+## Response yang diharapkan frontend
+
+Frontend expect body = ProductSizeBasic (JSON):
+  {
+    "id": "<uuid>",
+    "product_id": "<uuid>",
+    "size_label": "M",
+    "fabric_variant_name": "Waffle Blue",   // nullable
+    "reorder_min_qty": null,                // nullable
+    "selling_price": null,                  // nullable
+    "is_archived": false,
+    "current_stock_qty": 4,
+    "production_stock_qty": 4,
+    "manual_stock_qty": 0,
+    "latest_hpp_breakdown": null,           // nullable
+    "margin_pct": null                      // nullable
+  }
+
+(Sama persis dengan shape dari GET /products/{sku}/sizes list item)
+
+---
+
+## Langkah debugging (lakukan berurutan)
+
+### Step 1: Cari handler yang terdaftar
+
+  grep -r "stock-from-bahan\|stock_from_bahan" app/routers/
+  grep -r "stock-from-bahan\|stock_from_bahan" app/
+
+Jika tidak ditemukan → handler belum ada, perlu dibuat (lanjut ke Step 4).
+Jika ditemukan → catat file dan baris, lanjut ke Step 2.
+
+### Step 2: Verifikasi router registration
+
+Cek apakah file router yang berisi handler sudah di-include di main.py atau
+app/__init__.py. Kadang handler ada tapi routernya tidak di-register.
+
+  grep -r "include_router\|stock" app/main.py
+
+### Step 3: Test manual dengan curl
+
+  curl -X POST http://localhost:8000/products/{sku}/sizes/{size_id}/stock-from-bahan \
+    -H "Authorization: Bearer <token>" \
+    -H "Content-Type: application/json" \
+    -d '{"qty": 1, "spec_id": "<valid_spec_id>"}'
+
+Ambil spec_id yang valid dari:
+  curl http://localhost:8000/pattern-specs?product_sku={sku} \
+    -H "Authorization: Bearer <token>"
+
+Lihat response. Jika masih 404: routing belum terdaftar.
+Jika error lain: ada bug di handler.
+
+### Step 4: Jika handler belum ada — buat baru
+
+Buat endpoint di router yang relevan (kemungkinan app/routers/products.py):
+
+```python
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from uuid import UUID
+from app.database import get_db
+from app.models import ProductSize, PatternSpec, StockLedger, MaterialLedger
+from app.auth import get_current_user
+
+class StockFromBahanRequest(BaseModel):
+    qty: int
+    spec_id: UUID
+
+@router.post("/{sku}/sizes/{size_id}/stock-from-bahan")
+def add_stock_from_bahan(
+    sku: str,
+    size_id: UUID,
+    body: StockFromBahanRequest,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    # 1. Validate size exists and belongs to sku
+    size = db.query(ProductSize).filter(
+        ProductSize.id == size_id,
+        ProductSize.product_sku == sku
+    ).first()
+    if not size:
+        raise HTTPException(status_code=404, detail="ProductSize not found")
+
+    # 2. Validate spec exists and is active
+    spec = db.query(PatternSpec).filter(
+        PatternSpec.id == body.spec_id,
+        PatternSpec.is_active == True
+    ).first()
+    if not spec:
+        raise HTTPException(status_code=404, detail="PatternSpec not found")
+
+    # 3. Add production stock (reuse existing logic for adjust-stock)
+    size.current_stock_qty += body.qty
+    size.production_stock_qty = (size.production_stock_qty or 0) + body.qty
+
+    # 4. Create stock ledger entry
+    ledger = StockLedger(
+        product_size_id=size_id,
+        change_qty=body.qty,
+        reason="production",
+        note=f"QR scan produksi · spec {body.spec_id}"
+    )
+    db.add(ledger)
+
+    # 5. Deduct fabric stock
+    for fabric in spec.fabrics:
+        deduct_cm = fabric.cut_length_cm * body.qty
+        material = fabric.material  # assuming relationship loaded
+        if material:
+            material.remaining_length_cm = (material.remaining_length_cm or 0) - deduct_cm
+            # Add material ledger entry if you have one:
+            # mat_ledger = MaterialLedger(material_id=material.id, change_cm=-deduct_cm, reason="production")
+            # db.add(mat_ledger)
+
+    # 6. Deduct component/hardware stock
+    for component in spec.components:
+        deduct_qty = component.qty_per_unit * body.qty
+        material = component.material  # assuming relationship loaded
+        if material:
+            material.current_stock_qty = (material.current_stock_qty or 0) - deduct_qty
+
+    db.commit()
+    db.refresh(size)
+
+    # 7. Return ProductSizeBasic — use same serializer as GET /products/{sku}/sizes
+    return serialize_product_size_basic(size)
+```
+
+PENTING: Sesuaikan field names dan model relationships dengan kode yang sudah ada
+di codebase. Lihat handler adjust-stock untuk referensi cara deduct yang benar.
+
+---
+
+## Verifikasi setelah fix
+
+1. Test curl berhasil (200 OK, bukan 404)
+2. Cek BahanDetailView di app → ada entry pengurangan baru di Pergerakan Stok
+3. Test dari app iOS: scan QR → Dari Produksi → toggle ON → Simpan
+   → success screen TANPA warning kuning "Fitur ini memerlukan update server"
+
+---
+
+## Context
+
+- Frontend sudah handle 404 dengan fallback ke adjust-stock biasa
+- Saat endpoint berjalan, warning otomatis tidak muncul (tidak ada perubahan frontend lagi)
+- Spec lengkap ada di: backend/doc/implement-v3.19-manual-hpp-stock.txt (Task 7 tentang HPP fallback)
+- File frontend yang relevan: frontend/oura studio frontend/Screens/QR/ScanToStockSheet.swift (fungsi save())
