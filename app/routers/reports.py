@@ -13,6 +13,7 @@ from app.models.product import Product, ProductSize
 from app.models.production import ProductionBatch, ProductionBatchItem
 from app.models.sales import SalesOrder, SalesOrderItem
 from app.models.stock import StockLedger
+from app.routers.sales import get_hpp_for_sale
 from app.schemas.reports import (
     DashboardResponse,
     LowStockAlert,
@@ -189,26 +190,26 @@ def sales_report(
 
 @router.get("/margin-ranking", response_model=list[MarginRankingEntry])
 def margin_ranking(sort: str = Query(default="margin_pct"), db: Session = Depends(get_db)):
+    """v3.19 bug fix: previously only considered a confirmed ProductionBatchItem (get_hpp_for_sale's
+    tier 1), so any size priced via manual HPP or a PatternSpec estimate -- with no confirmed batch
+    at all -- silently never appeared here, returning []. Now reuses the same batch -> manual ->
+    pattern_spec -> none fallback POST /sales-orders uses, so this ranking reflects whatever HPP a
+    sale of that size would actually be costed at.
+    """
     if sort != "margin_pct":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="sort must be margin_pct")
 
     sizes = (
         db.query(ProductSize)
         .options(joinedload(ProductSize.product))
-        .filter(ProductSize.is_archived.is_(False), ProductSize.selling_price.isnot(None))
+        .filter(ProductSize.is_archived.is_(False), ProductSize.selling_price > 0)
         .all()
     )
 
     entries = []
     for size in sizes:
-        latest_item = (
-            db.query(ProductionBatchItem)
-            .join(ProductionBatch, ProductionBatchItem.production_batch_id == ProductionBatch.id)
-            .filter(ProductionBatchItem.product_size_id == size.id)
-            .order_by(ProductionBatch.produced_at.desc())
-            .first()
-        )
-        if latest_item is None:
+        hpp_total, _hpp_source = get_hpp_for_sale(db, size.id)
+        if hpp_total <= 0:
             continue
         entries.append(
             MarginRankingEntry(
@@ -217,8 +218,8 @@ def margin_ranking(sort: str = Query(default="margin_pct"), db: Session = Depend
                 size_label=size.size_label,
                 fabric_variant_name=size.fabric_variant_name,
                 selling_price=size.selling_price,
-                hpp_total=latest_item.hpp_total,
-                margin_pct=compute_margin_pct(size.selling_price, latest_item.hpp_total),
+                hpp_total=hpp_total,
+                margin_pct=compute_margin_pct(size.selling_price, hpp_total),
             )
         )
 

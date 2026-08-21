@@ -1,0 +1,118 @@
+FIX: GET /reports/margin-ranking mengembalikan array kosong
+============================================================
+
+Frontend memanggil endpoint ini dan mendapat response 200 OK dengan body [].
+Produk yang HPP-nya diset lewat ScanToStockSheet (manual_hpp_* fields) tidak
+muncul di ranking, meskipun selling_price dan manual_hpp sudah tersimpan.
+
+Endpoint seharusnya mengembalikan SEMUA product_sizes yang punya selling_price
++ HPP dari sumber manapun, tidak hanya yang punya batch produksi terkonfirmasi.
+
+---
+
+## Response shape yang diharapkan frontend
+
+GET /reports/margin-ranking?sort=margin_pct
+
+Response (array, sudah disort descending margin_pct):
+[
+  {
+    "product_size_id": "<uuid>",
+    "product_name":    "Scrunchie Waffle",
+    "size_label":      "S",
+    "fabric_variant_name": "Waffle Blue",   // nullable
+    "hpp_total":       18274.0,
+    "selling_price":   30000.0,
+    "margin_pct":      0.391                // (selling_price - hpp) / selling_price
+  },
+  ...
+]
+
+Hanya masuk jika:
+  - selling_price IS NOT NULL AND selling_price > 0
+  - hpp_total > 0 (dari sumber manapun, lihat prioritas di bawah)
+
+---
+
+## Prioritas sumber HPP (sama dengan get_hpp_for_sale)
+
+Untuk setiap ProductSize, hitung hpp_total dengan urutan fallback ini:
+
+  1. Batch HPP — dari ProductionBatch terkonfirmasi yang terkait size ini
+     (field: avg_hpp_per_unit atau unit_cost di ProductionBatch/CuttingLayout)
+
+  2. PatternSpec estimate — dari active PatternSpec untuk size ini
+     Gunakan fungsi yang sama dengan get_hpp_for_sale() Tier 2:
+     estimate_fabric_cost_per_piece_from_rate() per fabric di spec.fabrics,
+     tambah komponen, pooled rates, labor, overhead dari settings.
+     (Persis seperti yang sudah dilakukan di sales HPP fallback)
+
+  3. Manual HPP — dari kolom manual_hpp_* di tabel product_sizes:
+     hpp_total = manual_hpp_fabric + manual_hpp_pooled + manual_hpp_hardware
+               + manual_hpp_labor + manual_hpp_overhead
+     Masukkan jika total > 0.
+
+  4. Skip — jika tidak ada HPP dari tier 1-3, jangan masukkan size ini
+     ke hasil ranking (tidak ada data yang bisa ditampilkan).
+
+---
+
+## Cara implementasi yang disarankan
+
+Pseudocode di handler:
+
+  results = []
+  for size in ProductSize.query.filter(selling_price > 0, is_archived == False):
+      hpp = get_hpp_for_margin(size, db)  # fungsi baru, logika sama dengan get_hpp_for_sale
+      if hpp <= 0:
+          continue
+      margin = (size.selling_price - hpp) / size.selling_price
+      results.append({
+          "product_size_id":    size.id,
+          "product_name":       size.product.name,
+          "size_label":         size.size_label,
+          "fabric_variant_name": size.fabric_variant_name,
+          "hpp_total":          hpp,
+          "selling_price":      size.selling_price,
+          "margin_pct":         margin
+      })
+
+  # Sort by margin_pct descending
+  results.sort(key=lambda x: x["margin_pct"], reverse=True)
+  return results
+
+Fungsi get_hpp_for_margin(size, db) bisa me-reuse get_hpp_for_sale() yang
+sudah ada di sales service, atau extract logika fallback-nya ke fungsi shared.
+
+---
+
+## Cara verifikasi
+
+1. Pastikan ada product_size dengan:
+   - selling_price > 0
+   - manual_hpp_fabric + manual_hpp_labor + ... > 0
+   (Produk yang diset via ScanToStockSheet → Simpan HPP otomatis terisi)
+
+2. Panggil endpoint:
+   GET /reports/margin-ranking?sort=margin_pct
+   Authorization: Bearer <token>
+
+   Seharusnya mengembalikan array berisi produk tersebut, bukan [].
+
+3. Verifikasi margin_pct benar:
+   selling_price = 30000, hpp = 18274
+   margin_pct = (30000 - 18274) / 30000 = 0.3909 ≈ 0.391 ✓
+
+---
+
+## Context
+
+- Frontend memanggil: GET /reports/margin-ranking?sort=margin_pct
+- Frontend model: MarginRankingItem dengan field hpp_total (key: "hpp_total"),
+  margin_pct (key: "margin_pct")
+- Produk yang ada di DB saat ini HPP-nya diset via manual_hpp_* (ScanToStockSheet),
+  bukan dari batch produksi, sehingga endpoint yang hanya cek batch HPP
+  mengembalikan [] kosong.
+- File frontend: Screens/Lainnya/ReportsView.swift → MarginRankingView
+- File backend yang relevan: app/routers/reports.py, app/services/sales.py
+  (untuk reuse fungsi HPP fallback)
