@@ -1,5 +1,5 @@
-FIX: GET /reports/margin-ranking mengembalikan array kosong
-============================================================
+FIX: GET /reports/margin-ranking kosong + avg_margin_pct di dashboard 0%
+=========================================================================
 
 Frontend memanggil endpoint ini dan mendapat response 200 OK dengan body [].
 Produk yang HPP-nya diset lewat ScanToStockSheet (manual_hpp_* fields) tidak
@@ -102,6 +102,32 @@ sudah ada di sales service, atau extract logika fallback-nya ke fungsi shared.
 3. Verifikasi margin_pct benar:
    selling_price = 30000, hpp = 18274
    margin_pct = (30000 - 18274) / 30000 = 0.3909 ≈ 0.391 ✓
+
+---
+
+## Bug #2: avg_margin_pct di GET /dashboard selalu 0 / null
+
+Dashboard menampilkan "0% margin" karena backend mengembalikan:
+  { ..., "avg_margin_pct": 0.0 }  atau  "avg_margin_pct": null
+
+Frontend menggunakan `dashboard?.avgMarginPct ?? 0` — jika null/0, tampil 0%.
+
+### Fix
+
+Gunakan fungsi get_hpp_for_margin() yang sama (dari fix #1 di atas) untuk
+menghitung avg_margin_pct di endpoint dashboard:
+
+  valid_margins = []
+  for size in ProductSize.query.filter(selling_price > 0, is_archived == False):
+      hpp = get_hpp_for_margin(size, db)
+      if hpp > 0:
+          margin = (size.selling_price - hpp) / size.selling_price
+          valid_margins.append(margin)
+
+  avg_margin_pct = sum(valid_margins) / len(valid_margins) if valid_margins else 0.0
+
+Field response dashboard yang perlu diupdate:
+  "avg_margin_pct": 0.391   // rata-rata margin semua produk dengan HPP valid
 
 ---
 
