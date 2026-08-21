@@ -10,7 +10,7 @@ from app.deps import get_current_owner
 from app.models.cutting import CuttingLayout
 from app.models.material import Material, MaterialPurchase
 from app.models.product import Product, ProductSize
-from app.models.production import ProductionBatch, ProductionBatchItem
+from app.models.production import ProductionBatch
 from app.models.sales import SalesOrder, SalesOrderItem
 from app.models.stock import StockLedger
 from app.routers.sales import get_hpp_for_sale
@@ -60,28 +60,17 @@ def _low_stock_alerts(db: Session) -> list[LowStockAlert]:
 
 
 def _avg_margin_pct(db: Session) -> float:
-    # Same "latest confirmed item per size" semantics as products.py's _latest_hpp_map --
-    # must filter status='confirmed' or a newer draft's all-zero hpp_total would drag the average down.
-    sizes = db.query(ProductSize).filter(ProductSize.selling_price.isnot(None)).all()
-    if not sizes:
-        return 0.0
-    size_ids = [s.id for s in sizes]
-    rows = (
-        db.query(ProductionBatchItem)
-        .join(ProductionBatch, ProductionBatchItem.production_batch_id == ProductionBatch.id)
-        .filter(ProductionBatchItem.product_size_id.in_(size_ids), ProductionBatch.status == "confirmed")
-        .order_by(ProductionBatch.confirmed_at.desc().nullslast(), ProductionBatch.produced_at.desc())
-        .all()
-    )
-    latest_by_size: dict[uuid.UUID, ProductionBatchItem] = {}
-    for item in rows:
-        latest_by_size.setdefault(item.product_size_id, item)
-
-    margins = [
-        compute_margin_pct(size.selling_price, latest_by_size[size.id].hpp_total)
-        for size in sizes
-        if size.id in latest_by_size
-    ]
+    """v3.19 bug fix #2 (doc/fix-margin-ranking.txt): same issue as margin_ranking() below --
+    only ever averaged confirmed-batch HPP, so a shop running entirely on manual HPP /
+    PatternSpec-estimated sizes always got avg_margin_pct=0.0, shown as "0% margin" on the
+    dashboard. Reuses the same batch -> manual -> pattern_spec -> none fallback.
+    """
+    sizes = db.query(ProductSize).filter(ProductSize.selling_price > 0).all()
+    margins = []
+    for size in sizes:
+        hpp_total, _hpp_source = get_hpp_for_sale(db, size.id)
+        if hpp_total > 0:
+            margins.append(compute_margin_pct(size.selling_price, hpp_total))
     return sum(margins) / len(margins) if margins else 0.0
 
 
