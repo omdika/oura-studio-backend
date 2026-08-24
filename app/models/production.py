@@ -56,8 +56,8 @@ class ProductionBatchItem(Base):
     product_size_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("product_size.id"), nullable=False
     )
-    pattern_spec_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("pattern_spec.id"), nullable=False
+    pattern_spec_id: Mapped[uuid.UUID | None] = mapped_column( # v2.14: nullable for manual batches
+        UUID(as_uuid=True), ForeignKey("pattern_spec.id"), nullable=True
     )
     qty_actual: Mapped[int] = mapped_column(Integer, nullable=False)
     # v2.16: was a computed property derived from cutting_layout_item.qty_suggested, but a
@@ -78,7 +78,7 @@ class ProductionBatchItem(Base):
     material_purchase_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("material_purchase.id"), nullable=True
     )
-    fabric_cost_per_piece: Mapped[float] = mapped_column(Numeric(asdecimal=False), nullable=False)
+    fabric_cost_per_piece: Mapped[float | None] = mapped_column(Numeric(asdecimal=False), nullable=True) # v2.14: nullable for manual batches
     fabric_length_per_unit_cm: Mapped[float | None] = mapped_column(Numeric(asdecimal=False), nullable=True)
 
     cutting_layout_item: Mapped["CuttingLayoutItem | None"] = relationship()

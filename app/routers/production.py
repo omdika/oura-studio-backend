@@ -13,7 +13,7 @@ from app.models.pattern import PatternComponent, PatternSpec
 from app.models.production import ProductionBatch, ProductionBatchItem, ProductionBatchLayout
 from app.models.settings import Setting
 from app.models.stock import StockLedger
-from app.schemas.production import ItemQtyUpdate, ProductionBatchCreate, ProductionBatchItemOut, ProductionBatchOut
+from app.schemas.production import ItemQtyUpdate, ProductionBatchCreate, ProductionBatchItemCreate, ProductionBatchItemOut, ProductionBatchOut
 from app.services.hpp import compute_hpp
 
 router = APIRouter(prefix="/production-batches", tags=["production"], dependencies=[Depends(get_current_owner)])
@@ -292,14 +292,18 @@ def confirm_batch(batch_id: uuid.UUID, db: Session = Depends(get_db)):
     hardware_qty_by_material: dict[uuid.UUID, float] = {}
 
     for item in batch.items:
-        spec = db.get(PatternSpec, item.pattern_spec_id)
-        hardware_cost = _hardware_cost_per_unit(db, item.pattern_spec_id)
+        # For manual batches, pattern_spec_id can be None. Handle this gracefully.
+        spec = db.get(PatternSpec, item.pattern_spec_id) if item.pattern_spec_id else None
+        
+        # If no spec, HPP components from spec (labor, hardware) will be 0.
+        est_labor_minutes = spec.est_labor_minutes if spec else 0.0
+        hardware_cost = _hardware_cost_per_unit(db, item.pattern_spec_id) if item.pattern_spec_id else 0.0
 
         breakdown = compute_hpp(
-            fabric_cost_per_piece=item.fabric_cost_per_piece,
+            fabric_cost_per_piece=item.fabric_cost_per_piece or 0.0, # Use 0.0 if fabric_cost_per_piece is None
             pooled_material_rate=pooled_rate,
             hardware_cost_per_unit=hardware_cost,
-            est_labor_minutes=spec.est_labor_minutes,
+            est_labor_minutes=est_labor_minutes,
             labor_rate_per_minute=labor_rate,
             overhead_per_unit=overhead,
         )
@@ -321,10 +325,11 @@ def confirm_batch(batch_id: uuid.UUID, db: Session = Depends(get_db)):
             )
         )
 
-        for comp in db.query(PatternComponent).filter(PatternComponent.pattern_spec_id == item.pattern_spec_id).all():
-            hardware_qty_by_material[comp.material_id] = (
-                hardware_qty_by_material.get(comp.material_id, 0.0) + comp.qty_per_unit * item.qty_actual
-            )
+        if spec: # Only deduct components if a spec exists
+            for comp in db.query(PatternComponent).filter(PatternComponent.pattern_spec_id == item.pattern_spec_id).all():
+                hardware_qty_by_material[comp.material_id] = (
+                    hardware_qty_by_material.get(comp.material_id, 0.0) + comp.qty_per_unit * item.qty_actual
+                )
 
     # v2.16: deduct fabric from every linked layout's own purchase directly (not via the batch
     # items' material_purchase_id, which is only set for single-fabric items) -- this is also
@@ -345,3 +350,64 @@ def confirm_batch(batch_id: uuid.UUID, db: Session = Depends(get_db)):
     batch.confirmed_at = datetime.now(timezone.utc)
     db.commit()
     return _batch_out(_get_batch_or_404(db, batch_id))
+
+
+# v2.14: New endpoint to add items to a manual batch
+@router.post("/{batch_id}/items", response_model=ProductionBatchItemOut, status_code=status.HTTP_201_CREATED)
+def add_batch_item(batch_id: uuid.UUID, body: ProductionBatchItemCreate, db: Session = Depends(get_db)):
+    batch = _get_batch_or_404(db, batch_id)
+    if batch.status != "draft":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only draft batches can have items added")
+
+    # Validate product_size_id
+    product_size = db.get(ProductSize, body.product_size_id)
+    if product_size is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product size not found")
+
+    # Resolve latest active PatternSpec for this product_size_id
+    pattern_spec = (
+        db.query(PatternSpec)
+        .filter(PatternSpec.product_size_id == body.product_size_id, PatternSpec.is_active.is_(True))
+        .order_by(PatternSpec.effective_from.desc())
+        .first()
+    )
+
+    item = ProductionBatchItem(
+        production_batch_id=batch.id,
+        product_size_id=body.product_size_id,
+        pattern_spec_id=pattern_spec.id if pattern_spec else None,
+        qty_actual=body.qty_actual,
+        qty_suggested=None,  # No cutting layout for manual entry
+        cutting_layout_item_id=None,
+        material_purchase_id=None,
+        fabric_cost_per_piece=None, # No fabric cost from cutting layout for manual entry
+        fabric_length_per_unit_cm=None,
+        hpp_fabric=0,
+        hpp_pooled_material=0,
+        hpp_hardware=0,
+        hpp_labor=0,
+        hpp_overhead=0,
+        hpp_total=0,
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+# v2.14: New endpoint to delete items from a manual batch
+@router.delete("/{batch_id}/items/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_batch_item(batch_id: uuid.UUID, item_id: uuid.UUID, db: Session = Depends(get_db)):
+    batch = _get_batch_or_404(db, batch_id)
+    if batch.status != "draft":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only draft batches can have items deleted")
+
+    item = db.query(ProductionBatchItem).filter(
+        ProductionBatchItem.id == item_id, ProductionBatchItem.production_batch_id == batch_id
+    ).first()
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Production batch item not found")
+
+    db.delete(item)
+    db.commit()
+    return None

@@ -22,18 +22,24 @@ class ItemQtyUpdate(BaseModel):
     qty_actual: int = Field(ge=0)
 
 
+# v2.14: New schema for adding items to a manual batch
+class ProductionBatchItemCreate(BaseModel):
+    product_size_id: uuid.UUID
+    qty_actual: int = Field(ge=1)
+
+
 class ProductionBatchItemOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     production_batch_id: uuid.UUID
     product_size_id: uuid.UUID
-    pattern_spec_id: uuid.UUID
+    pattern_spec_id: uuid.UUID | None # v2.14: nullable for manual batches
     qty_actual: int
     qty_suggested: int | None
     cutting_layout_item_id: uuid.UUID | None
     material_purchase_id: uuid.UUID | None
-    fabric_cost_per_piece: float
+    fabric_cost_per_piece: float | None # v2.14: nullable for manual batches
     fabric_length_per_unit_cm: float | None
     hpp_fabric: float
     hpp_pooled_material: float
