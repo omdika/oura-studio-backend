@@ -74,3 +74,13 @@ class WasteByMaterialEntry(BaseModel):
     material_name: str
     layout_count: int
     avg_waste_pct: float
+
+
+class ProductSalesRankingEntry(BaseModel):
+    product_size_id: uuid.UUID
+    product_name: str
+    size_label: str
+    fabric_variant_name: str | None
+    qty_sold: int
+    revenue: float
+    profit: float

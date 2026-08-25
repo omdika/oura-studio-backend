@@ -23,6 +23,7 @@ from app.schemas.reports import (
     StockCardMovement,
     StockCardResponse,
     WasteByMaterialEntry,
+    ProductSalesRankingEntry,
 )
 from app.services.pricing import compute_margin_pct
 from app.services.reports import bucket_start
@@ -305,3 +306,61 @@ def waste_by_material(
 @router.get("/low-stock", response_model=list[LowStockAlert])
 def low_stock(db: Session = Depends(get_db)):
     return _low_stock_alerts(db)
+
+
+@router.get("/sales-by-product", response_model=list[ProductSalesRankingEntry])
+def product_sales_ranking(
+    from_: date | None = Query(default=None, alias="from"),
+    to: date | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    if from_ is None or to is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from and to are required")
+    if from_ > to:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from must be <= to")
+
+    start = datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc)
+    end = datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1)
+
+    from sqlalchemy import func
+
+    results = (
+        db.query(
+            ProductSize.id.label("product_size_id"),
+            Product.name.label("product_name"),
+            ProductSize.size_label.label("size_label"),
+            ProductSize.fabric_variant_name.label("fabric_variant_name"),
+            func.sum(SalesOrderItem.qty).label("qty_sold"),
+            func.sum((SalesOrderItem.unit_price - SalesOrderItem.discount) * SalesOrderItem.qty).label("revenue"),
+            func.sum(SalesOrderItem.line_profit).label("profit"),
+        )
+        .join(SalesOrderItem, ProductSize.id == SalesOrderItem.product_size_id)
+        .join(SalesOrder, SalesOrderItem.sales_order_id == SalesOrder.id)
+        .join(Product, ProductSize.product_id == Product.id)
+        .filter(
+            SalesOrder.sold_at >= start,
+            SalesOrder.sold_at < end,
+            SalesOrder.status != "cancelled"
+        )
+        .group_by(
+            ProductSize.id,
+            Product.name,
+            ProductSize.size_label,
+            ProductSize.fabric_variant_name
+        )
+        .order_by(func.sum(SalesOrderItem.qty).desc())
+        .all()
+    )
+
+    return [
+        ProductSalesRankingEntry(
+            product_size_id=r.product_size_id,
+            product_name=r.product_name,
+            size_label=r.size_label,
+            fabric_variant_name=r.fabric_variant_name,
+            qty_sold=int(r.qty_sold),
+            revenue=float(r.revenue),
+            profit=float(r.profit),
+        )
+        for r in results
+    ]
