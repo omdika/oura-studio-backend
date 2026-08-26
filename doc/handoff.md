@@ -14,6 +14,7 @@ This doc is structured for three audiences reading in parallel:
 
 | Version | Date | Changed by | Summary |
 |---|---|---|---|
+| v3.24 | 2026-08-25 | Irma | **IMPLEMENTED: Rilis Perbaikan irma/fix.** Serangkaian perbaikan bug kritis (detail invoice penjualan, estimasi HPP, caption pencetakan QR PDF, auto SKU) dan peningkatan fitur (grafik penjualan "Per Barang", pengurutan XS→XXL secara dinamis). Rincian spesifikasi: `doc/versions/v3.24.md`. |
 | v3.23 | 2026-08-25 | Frontend | **IMPLEMENTED: Ringkasan Statistik Produk di ProdukListView.** Menambahkan kartu statistik horizontal (Total Jenis Produk, Total Stok, dan Varian Stok Kosong) di bagian paling atas daftar produk. Rincian spesifikasi: `doc/versions/v3.23.md`. |
 | v3.22 | 2026-08-25 | Frontend+Backend | **IMPLEMENTED: Ranking Penjualan per Produk di halaman Lainnya.** Menambahkan menu baru "Ranking Penjualan Produk" di bawah "Laporan Penjualan" di tab Lainnya. Menghubungkan visualisasi data dengan endpoint baru `/reports/sales-by-product` pada backend API. Rincian spesifikasi: `doc/versions/v3.22.md`. |
 | v3.21 | 2026-08-21 | Design | **PLANNED: Arsip Bahan (Material Archive).** Fitur menyembunyikan bahan discontinued tanpa merusak resep/produksi historis. Tambah toggle filter di BahanListView dan banner di BahanDetailView. Lihat `doc/versions/v3.21.md`. |
