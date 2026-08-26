@@ -4,7 +4,7 @@ from collections import defaultdict
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from slugify import slugify
 from sqlalchemy import case, func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.deps import get_current_owner
@@ -497,6 +497,65 @@ def get_product_size(sku: str, size_id: uuid.UUID, db: Session = Depends(get_db)
     product = _get_product_or_404(db, sku)
     size = _get_size_or_404(db, product, size_id)
     return _size_detail_out(db, size)
+
+
+
+
+@router.get("/product-sizes", response_model=list[ProductSizeWithProductOut])
+def list_all_product_sizes(
+    archived: bool = False,
+    db: Session = Depends(get_db),
+):
+    """v3.22: Optimized bulk endpoint to fetch all sizes across all active products in a single call,
+    completely resolving the N+1 HTTP request bottleneck on the iOS client.
+    """
+    sizes = (
+        db.query(ProductSize)
+        .options(joinedload(ProductSize.product))
+        .join(Product, ProductSize.product_id == Product.id)
+        .filter(ProductSize.is_archived == archived, Product.is_archived.is_(False))
+        .order_by(Product.name, ProductSize.size_label)
+        .all()
+    )
+    size_ids = [s.id for s in sizes]
+    stock_map = _stock_qty_map(db, size_ids)
+    breakdown_map = _stock_breakdown_map(db, size_ids)
+    hpp_map = _latest_hpp_map(db, size_ids)
+    batch_ids = [item.production_batch_id for item in hpp_map.values()]
+    fabric_map = _fabric_items_map(db, batch_ids)
+    hardware_map = _hardware_items_map(db, size_ids)
+
+    return [
+        ProductSizeWithProductOut(
+            id=s.id,
+            product_id=s.product_id,
+            size_label=s.size_label,
+            fabric_variant_name=s.fabric_variant_name,
+            reorder_min_qty=s.reorder_min_qty,
+            selling_price=s.selling_price,
+            is_archived=s.is_archived,
+            manual_hpp_fabric=s.manual_hpp_fabric,
+            manual_hpp_pooled=s.manual_hpp_pooled,
+            manual_hpp_hardware=s.manual_hpp_hardware,
+            manual_hpp_labor=s.manual_hpp_labor,
+            manual_hpp_overhead=s.manual_hpp_overhead,
+            manual_hpp_total=s.manual_hpp_total,
+            current_stock_qty=stock_map.get(s.id, 0),
+            production_stock_qty=breakdown_map.get(s.id, (0, 0))[0],
+            manual_stock_qty=breakdown_map.get(s.id, (0, 0))[1],
+            latest_hpp_breakdown=_hpp_breakdown_out(
+                hpp_map.get(s.id),
+                fabric_map.get((hpp_map[s.id].production_batch_id, s.id), []) if s.id in hpp_map else [],
+                hardware_map.get(s.id, []),
+            ),
+            margin_pct=compute_margin_pct(s.selling_price, hpp_map[s.id].hpp_total)
+                if s.selling_price is not None and s.id in hpp_map and hpp_map[s.id] is not None
+                else None,
+            product_sku=s.product.sku,
+            product_name=s.product.name,
+        )
+        for s in sizes
+    ]
 
 
 @router.get("/product-sizes/{size_id}", response_model=ProductSizeWithProductOut)
