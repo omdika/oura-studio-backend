@@ -84,3 +84,4 @@ class ProductSalesRankingEntry(BaseModel):
     qty_sold: int
     revenue: float
     profit: float
+    current_stock_qty: int

@@ -352,6 +352,10 @@ def product_sales_ranking(
         .all()
     )
 
+    from app.routers.products import _stock_qty_map
+    size_ids = [r.product_size_id for r in results]
+    stock_map = _stock_qty_map(db, size_ids)
+
     return [
         ProductSalesRankingEntry(
             product_size_id=r.product_size_id,
@@ -361,6 +365,7 @@ def product_sales_ranking(
             qty_sold=int(r.qty_sold),
             revenue=float(r.revenue),
             profit=float(r.profit),
+            current_stock_qty=stock_map.get(r.product_size_id, 0),
         )
         for r in results
     ]
