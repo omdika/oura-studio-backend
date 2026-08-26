@@ -10,7 +10,7 @@ class LowStockAlert(BaseModel):
     size_label: str
     fabric_variant_name: str | None
     current_stock_qty: int
-    reorder_min_qty: float
+    reorder_min_qty: float | None = None
 
 
 class DashboardResponse(BaseModel):

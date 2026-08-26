@@ -35,18 +35,22 @@ def _low_stock_alerts(db: Session) -> list[LowStockAlert]:
     sizes = (
         db.query(ProductSize)
         .options(joinedload(ProductSize.product))
-        .filter(ProductSize.is_archived.is_(False), ProductSize.reorder_min_qty.isnot(None))
+        .filter(ProductSize.is_archived.is_(False))
         .all()
     )
     alerts = []
+    
+    # Anti-N+1: batch query all stock levels using stock map
+    from app.routers.products import _stock_qty_map
+    size_ids = [s.id for s in sizes]
+    stock_map = _stock_qty_map(db, size_ids)
+    
     for size in sizes:
-        qty = (
-            db.query(StockLedger)
-            .with_entities(StockLedger.change_qty)
-            .filter(StockLedger.product_size_id == size.id)
-        )
-        current_qty = sum(row[0] for row in qty.all())
-        if current_qty < size.reorder_min_qty:
+        current_qty = stock_map.get(size.id, 0)
+        is_low_stock = (size.reorder_min_qty is not None and current_qty < size.reorder_min_qty)
+        is_empty_stock = (current_qty == 0)
+        
+        if is_empty_stock or is_low_stock:
             alerts.append(
                 LowStockAlert(
                     product_size_id=size.id,
