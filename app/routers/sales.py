@@ -1,4 +1,5 @@
 import uuid
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func
@@ -299,6 +300,8 @@ def create_sales_order(body: SalesOrderCreate, db: Session = Depends(get_db)):
 @router.get("", response_model=list[SalesOrderOut])
 def list_sales_orders(
     status_filter: str | None = Query(default=None, alias="status"),
+    from_: date | None = Query(default=None, alias="from"),
+    to: date | None = Query(default=None),
     limit: int = Query(default=50, le=200),
     offset: int = 0,
     db: Session = Depends(get_db),
@@ -306,6 +309,13 @@ def list_sales_orders(
     q = db.query(SalesOrder).options(joinedload(SalesOrder.items))
     if status_filter is not None:
         q = q.filter(SalesOrder.status == status_filter)
+    if from_ is not None:
+        start = datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc)
+        q = q.filter(SalesOrder.sold_at >= start)
+    if to is not None:
+        end = datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1)
+        q = q.filter(SalesOrder.sold_at < end)
+        
     orders = q.order_by(SalesOrder.sold_at.desc()).offset(offset).limit(limit).all()
     return _orders_out(db, orders)
 
