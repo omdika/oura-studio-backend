@@ -34,8 +34,9 @@ router = APIRouter(prefix="/reports", tags=["reports"], dependencies=[Depends(ge
 def _low_stock_alerts(db: Session) -> list[LowStockAlert]:
     sizes = (
         db.query(ProductSize)
+        .join(Product)
         .options(joinedload(ProductSize.product))
-        .filter(ProductSize.is_archived.is_(False))
+        .filter(ProductSize.is_archived.is_(False), Product.is_archived.is_(False))
         .all()
     )
     alerts = []
@@ -64,21 +65,6 @@ def _low_stock_alerts(db: Session) -> list[LowStockAlert]:
     return alerts
 
 
-def _avg_margin_pct(db: Session) -> float:
-    """v3.19 bug fix #2 (doc/fix-margin-ranking.txt): same issue as margin_ranking() below --
-    only ever averaged confirmed-batch HPP, so a shop running entirely on manual HPP /
-    PatternSpec-estimated sizes always got avg_margin_pct=0.0, shown as "0% margin" on the
-    dashboard. Reuses the same batch -> manual -> pattern_spec -> none fallback.
-    """
-    sizes = db.query(ProductSize).filter(ProductSize.selling_price > 0).all()
-    margins = []
-    for size in sizes:
-        hpp_total, _hpp_source = get_hpp_for_sale(db, size.id)
-        if hpp_total > 0:
-            margins.append(compute_margin_pct(size.selling_price, hpp_total))
-    return sum(margins) / len(margins) if margins else 0.0
-
-
 @router.get("/dashboard", response_model=DashboardResponse)
 def dashboard(db: Session = Depends(get_db)):
     # "today"/"this month" per server timezone -- this server runs in UTC (Cloud Run default, no
@@ -101,26 +87,53 @@ def dashboard(db: Session = Depends(get_db)):
         .all()
     )
 
+    # Collect all product size IDs from today's and this month's orders to verify active/archived status
+    size_ids = set()
+    for order in today_orders:
+        for item in order.items:
+            size_ids.add(item.product_size_id)
+    for order in month_orders_list:
+        for item in order.items:
+            size_ids.add(item.product_size_id)
+
+    # Query active sizes and products (not archived)
+    active_sizes = (
+        db.query(ProductSize)
+        .join(Product)
+        .filter(
+            ProductSize.id.in_(list(size_ids)),
+            ProductSize.is_archived.is_(False),
+            Product.is_archived.is_(False)
+        )
+        .all() if size_ids else []
+    )
+    active_size_ids = {s.id for s in active_sizes}
+
     today_revenue = today_profit = 0.0
     today_units_sold = 0
     for order in today_orders:
         for item in order.items:
-            today_revenue += (item.unit_price - item.discount) * item.qty
-            today_profit += item.line_profit
-            today_units_sold += item.qty
+            if item.product_size_id in active_size_ids:
+                today_revenue += (item.unit_price - item.discount) * item.qty
+                today_profit += item.line_profit
+                today_units_sold += item.qty
 
     month_revenue = 0.0
     month_units_sold = 0
     for order in month_orders_list:
         for item in order.items:
-            month_revenue += (item.unit_price - item.discount) * item.qty
-            month_units_sold += item.qty
+            if item.product_size_id in active_size_ids:
+                month_revenue += (item.unit_price - item.discount) * item.qty
+                month_units_sold += item.qty
 
     month_batches_confirmed = (
         db.query(ProductionBatch)
         .filter(ProductionBatch.status == "confirmed", ProductionBatch.confirmed_at >= month_start)
         .count()
     )
+
+    # Calculate today's actual margin based only on today's non-archived sales
+    today_margin = today_profit / today_revenue if today_revenue > 0 else 0.0
 
     return DashboardResponse(
         today_revenue=today_revenue,
@@ -131,7 +144,7 @@ def dashboard(db: Session = Depends(get_db)):
         month_orders=len(month_orders_list),
         month_units_sold=month_units_sold,
         month_batches_confirmed=month_batches_confirmed,
-        avg_margin_pct=_avg_margin_pct(db),
+        avg_margin_pct=today_margin,
         low_stock_alerts=_low_stock_alerts(db),
     )
 
@@ -195,8 +208,9 @@ def margin_ranking(sort: str = Query(default="margin_pct"), db: Session = Depend
 
     sizes = (
         db.query(ProductSize)
+        .join(Product)
         .options(joinedload(ProductSize.product))
-        .filter(ProductSize.is_archived.is_(False), ProductSize.selling_price > 0)
+        .filter(ProductSize.is_archived.is_(False), Product.is_archived.is_(False), ProductSize.selling_price > 0)
         .all()
     )
 
