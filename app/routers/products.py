@@ -790,3 +790,26 @@ def add_stock_from_bahan(sku: str, size_id: uuid.UUID, body: AddStockFromBahanRe
     db.refresh(size)
 
     return _size_detail_out(db, size)
+
+
+# --- v3.44: Stock Ledger Endpoint ---
+from app.schemas.product import StockAdjustmentOut
+from datetime import date
+
+@router.get("/stock-ledger", response_model=list[StockAdjustmentOut])
+def get_stock_ledger(
+    from_date: date = Query(..., alias="from"),
+    to_date: date = Query(..., alias="to"),
+    db: Session = Depends(get_db)
+):
+    from datetime import datetime, timedelta
+    start_dt = datetime.combine(from_date, datetime.min.time())
+    end_dt = datetime.combine(to_date, datetime.min.time()) + timedelta(days=1)
+    
+    entries = (
+        db.query(StockLedger)
+        .filter(StockLedger.created_at >= start_dt, StockLedger.created_at < end_dt)
+        .order_by(StockLedger.created_at.asc())
+        .all()
+    )
+    return entries
