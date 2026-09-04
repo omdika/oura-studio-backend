@@ -150,14 +150,14 @@ def google_sign_in(body: GoogleAuthRequest, db: Session = Depends(get_db)):
             if owner.google_sub != google_sub:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Google account mismatch")
         
-        token, expires_at = create_access_token(owner.id)
+        token, expires_at = create_access_token(owner.id, owner.email, owner.role)
         return TokenResponse(access_token=token, expires_at=expires_at)
 
     owner = db.query(OwnerAccount).filter(OwnerAccount.email == email).first()
     if owner is not None:
         if owner.google_sub != google_sub:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Google account mismatch")
-        token, expires_at = create_access_token(owner.id)
+        token, expires_at = create_access_token(owner.id, owner.email, owner.role)
         return TokenResponse(access_token=token, expires_at=expires_at)
 
     if not body.invitation_token:
@@ -193,5 +193,5 @@ def google_sign_in(body: GoogleAuthRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(owner)
 
-    token, expires_at = create_access_token(owner.id)
+    token, expires_at = create_access_token(owner.id, owner.email, owner.role)
     return TokenResponse(access_token=token, expires_at=expires_at)

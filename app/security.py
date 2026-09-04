@@ -6,10 +6,10 @@ from jose import JWTError, jwt
 from app.config import settings
 
 
-def create_access_token(owner_id: uuid.UUID) -> tuple[str, datetime]:
+def create_access_token(owner_id: uuid.UUID, email: str, role: str) -> tuple[str, datetime]:
     now = datetime.now(timezone.utc)
     expire = now + timedelta(minutes=settings.jwt_expire_minutes)
-    payload = {"sub": str(owner_id), "iat": now, "exp": expire}
+    payload = {"sub": str(owner_id), "email": email, "role": role, "iat": now, "exp": expire}
     token = jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
     return token, expire
 
