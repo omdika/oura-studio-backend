@@ -25,3 +25,14 @@ def get_current_owner(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Owner not found")
 
     return owner
+
+
+def get_current_admin(
+    owner: OwnerAccount = Depends(get_current_owner)
+) -> OwnerAccount:
+    if owner.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Hanya Admin yang dapat melakukan tindakan ini"
+        )
+    return owner

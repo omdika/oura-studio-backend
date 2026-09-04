@@ -1,6 +1,6 @@
 from app.models.cutting import CuttingLayout, CuttingLayoutItem
 from app.models.material import Material, MaterialPurchase, Supplier
-from app.models.owner import OwnerAccount
+from app.models.owner import Invitation, OwnerAccount
 from app.models.pattern import PatternComponent, PatternSpec, PatternSpecFabric
 from app.models.product import Product, ProductSize
 from app.models.production import ProductionBatch, ProductionBatchItem, ProductionBatchLayout
@@ -10,6 +10,7 @@ from app.models.stock import StockLedger
 
 __all__ = [
     "OwnerAccount",
+    "Invitation",
     "Material",
     "MaterialPurchase",
     "Supplier",

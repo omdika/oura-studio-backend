@@ -21,3 +21,20 @@ def decode_access_token(token: str) -> uuid.UUID | None:
         return uuid.UUID(sub) if sub else None
     except (JWTError, ValueError):
         return None
+
+
+def create_invitation_token(email: str) -> str:
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(hours=1)
+    payload = {"sub": email, "type": "invitation", "iat": now, "exp": expire}
+    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def decode_invitation_token(token: str) -> str | None:
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        if payload.get("type") != "invitation":
+            return None
+        return payload.get("sub")
+    except (JWTError, ValueError):
+        return None

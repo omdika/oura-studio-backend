@@ -5,6 +5,7 @@ from app.routers import auth, cutting_optimizer, materials, pattern_specs, produ
 app = FastAPI(title="Oura Studios API", version="3.8.0")
 
 app.include_router(auth.router, prefix="/api/v1")
+app.include_router(auth.router_invitations, prefix="/api/v1")
 app.include_router(materials.router, prefix="/api/v1")
 app.include_router(suppliers.router, prefix="/api/v1")
 app.include_router(products.router, prefix="/api/v1")
