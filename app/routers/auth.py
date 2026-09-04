@@ -42,7 +42,7 @@ def create_invitation(
     db: Session = Depends(get_db),
     admin: OwnerAccount = Depends(get_current_admin)
 ):
-    if body.email.lower() == settings.authorized_owner_email.lower():
+    if body.email.lower() in settings.authorized_owner_emails:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email admin tidak perlu diundang"
@@ -135,7 +135,7 @@ def google_sign_in(body: GoogleAuthRequest, db: Session = Depends(get_db)):
 
     now = datetime.now(timezone.utc)
 
-    if email == settings.authorized_owner_email.lower():
+    if email in settings.authorized_owner_emails:
         owner = db.query(OwnerAccount).filter(OwnerAccount.email == email).first()
         if owner is None:
             owner = OwnerAccount(google_sub=google_sub, email=email, role="admin")

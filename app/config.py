@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
+    def authorized_owner_emails(self) -> set[str]:
+        return {e.strip().lower() for e in self.authorized_owner_email.split(",") if e.strip()}
+
+    @property
     def database_url(self) -> str:
         return self.supabase_db_url
 
