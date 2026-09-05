@@ -46,6 +46,7 @@ class ProductSize(Base):
     manual_hpp_overhead: Mapped[float | None] = mapped_column(Numeric(14, 4, asdecimal=False), nullable=True)
 
     product: Mapped["Product"] = relationship(back_populates="sizes")
+    images: Mapped[list["ProductSizeImage"]] = relationship(back_populates="product_size", cascade="all, delete-orphan")
 
     @property
     def manual_hpp_total(self) -> float:
@@ -60,3 +61,14 @@ class ProductSize(Base):
     @property
     def has_manual_hpp(self) -> bool:
         return self.manual_hpp_total > 0
+
+
+class ProductSizeImage(Base):
+    __tablename__ = "product_size_image"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    product_size_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("product_size.id", ondelete="CASCADE"), nullable=False)
+    image_url: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    product_size: Mapped["ProductSize"] = relationship(back_populates="images")

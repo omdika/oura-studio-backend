@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     authorized_owner_email: str = "owner@example.com"
     google_client_id: str = "change-me.apps.googleusercontent.com"
 
+    # GCS Bucket Name (v3.50)
+    gcs_bucket_name: str = "oura-studio-prod-bucket"
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property

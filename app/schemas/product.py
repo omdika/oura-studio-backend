@@ -24,6 +24,16 @@ class ProductOut(BaseModel):
     created_at: datetime
 
 
+
+class ProductSizeImageOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    product_size_id: uuid.UUID
+    image_url: str
+    created_at: datetime
+
+
 class ProductSizeCreate(BaseModel):
     size_label: str
     fabric_variant_name: str | None = None
@@ -64,6 +74,7 @@ class ProductSizeOut(BaseModel):
     manual_hpp_labor: float | None = None
     manual_hpp_overhead: float | None = None
     manual_hpp_total: float = 0
+    images: list[ProductSizeImageOut] = []
 
 
 class HppLineItemOut(BaseModel):
