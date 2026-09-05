@@ -376,7 +376,7 @@ def create_product(body: ProductCreate, db: Session = Depends(get_db)):
 def list_products(
     include_archived: bool = False,
     search: str | None = None,
-    limit: int = Query(default=50, le=200),
+    limit: int = Query(default=200, le=500),
     offset: int = 0,
     db: Session = Depends(get_db),
 ):
