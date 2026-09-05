@@ -858,6 +858,10 @@ async def upload_product_size_image(
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
         blob.upload_from_string(file_bytes, content_type="image/jpeg")
+        try:
+            blob.make_public()
+        except Exception as e:
+            print(f"GCS make_public failed: {e}. This is normal if Uniform Bucket-Level Access is enabled.")
         image_url = f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
     except Exception as e:
         print(f"GCS Upload failed: {e}. Falling back to expected GCS URL for development.")
