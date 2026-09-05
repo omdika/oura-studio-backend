@@ -845,16 +845,23 @@ async def upload_product_size_image(
     blob_name = f"products/{sku}/sizes/{size_id}/{image_id}.jpg"
     from app.config import settings
 
+    # Clean bucket name (remove gs:// prefix and trailing slash if present)
+    bucket_name = settings.gcs_bucket_name.strip()
+    if bucket_name.startswith("gs://"):
+        bucket_name = bucket_name[5:]
+    if bucket_name.endswith("/"):
+        bucket_name = bucket_name[:-1]
+
     try:
         from google.cloud import storage
         client = storage.Client()
-        bucket = client.bucket(settings.gcs_bucket_name)
+        bucket = client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
         blob.upload_from_string(file_bytes, content_type="image/jpeg")
-        image_url = f"https://storage.googleapis.com/{settings.gcs_bucket_name}/{blob_name}"
+        image_url = f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
     except Exception as e:
         print(f"GCS Upload failed: {e}. Falling back to expected GCS URL for development.")
-        image_url = f"https://storage.googleapis.com/{settings.gcs_bucket_name}/{blob_name}"
+        image_url = f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
 
     new_image = ProductSizeImage(
         id=image_id,
@@ -890,14 +897,22 @@ def delete_product_size_image(
 
     # Delete from GCS
     from app.config import settings
+    
+    # Clean bucket name
+    bucket_name = settings.gcs_bucket_name.strip()
+    if bucket_name.startswith("gs://"):
+        bucket_name = bucket_name[5:]
+    if bucket_name.endswith("/"):
+        bucket_name = bucket_name[:-1]
+
     image_url = image_record.image_url
-    prefix = f"https://storage.googleapis.com/{settings.gcs_bucket_name}/"
+    prefix = f"https://storage.googleapis.com/{bucket_name}/"
     if image_url.startswith(prefix):
         blob_name = image_url[len(prefix):]
         try:
             from google.cloud import storage
             client = storage.Client()
-            bucket = client.bucket(settings.gcs_bucket_name)
+            bucket = client.bucket(bucket_name)
             blob = bucket.blob(blob_name)
             blob.delete()
         except Exception as e:
