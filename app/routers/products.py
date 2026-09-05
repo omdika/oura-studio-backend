@@ -542,6 +542,7 @@ def list_all_product_sizes(
             manual_hpp_labor=s.manual_hpp_labor,
             manual_hpp_overhead=s.manual_hpp_overhead,
             manual_hpp_total=s.manual_hpp_total,
+            images=s.images,
             current_stock_qty=stock_map.get(s.id, 0),
             production_stock_qty=breakdown_map.get(s.id, (0, 0))[0],
             manual_stock_qty=breakdown_map.get(s.id, (0, 0))[1],
