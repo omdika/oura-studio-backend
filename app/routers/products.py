@@ -523,7 +523,37 @@ Toleransi jahitan 0.5 - 1 cm.
             else:
                 col_19 = f"{product.sku}-{size.size_label}".upper()
                 
-            col_20 = col_21 = col_22 = col_23 = col_24 = col_25 = col_26 = col_27 = col_28 = col_29 = col_30 = col_31 = ""
+            col_20 = col_21 = col_22 = ""
+            col_23 = ""
+            col_24 = ""
+            col_25 = ""
+            col_26 = ""
+            col_27 = ""
+            col_28 = ""
+            col_29 = ""
+            col_30 = ""
+            col_31 = ""
+            
+            if size.images:
+                num_imgs = len(size.images)
+                if num_imgs > 0:
+                    col_23 = size.images[0].image_url
+                if num_imgs > 1:
+                    col_24 = size.images[1].image_url
+                if num_imgs > 2:
+                    col_25 = size.images[2].image_url
+                if num_imgs > 3:
+                    col_26 = size.images[3].image_url
+                if num_imgs > 4:
+                    col_27 = size.images[4].image_url
+                if num_imgs > 5:
+                    col_28 = size.images[5].image_url
+                if num_imgs > 6:
+                    col_29 = size.images[6].image_url
+                if num_imgs > 7:
+                    col_30 = size.images[7].image_url
+                if num_imgs > 8:
+                    col_31 = size.images[8].image_url
             col_32 = weight
             col_33 = length
             col_34 = width
