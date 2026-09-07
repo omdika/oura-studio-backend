@@ -505,7 +505,7 @@ Ideal untuk menyimpan makeup, skincare, dan essentials kamu — whether for dail
                 
             col_4 = col_5 = col_6 = col_7 = col_8 = ""
             col_9 = product.sku if idx == 0 else ""
-            col_10 = "No"
+            col_10 = "No (ID)"
             col_11 = product.sku
             col_12 = "Ukuran"
             
@@ -563,10 +563,10 @@ Ideal untuk menyimpan makeup, skincare, dan essentials kamu — whether for dail
             col_34 = width
             col_35 = height
             
-            col_36 = "Nonaktif"
+            col_36 = "Tidak Aktif"
             col_37 = "Aktif"
-            col_38 = "Nonaktif"
-            col_39 = "Nonaktif"
+            col_38 = "Tidak Aktif"
+            col_39 = "Tidak Aktif"
             col_40 = ""
             col_41 = ""
             

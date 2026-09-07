@@ -102,10 +102,11 @@ def main():
                 assert row_vals[32] == 15 and row_vals[33] == 12 and row_vals[34] == 5, f"Incorrect dimensions for pouch"
             
             assert row_vals[11] == "Ukuran", f"Incorrect variation name: {row_vals[11]}"
-            assert row_vals[35] == "Nonaktif", "Same Day should be Nonaktif"
+            assert row_vals[35] == "Tidak Aktif", "Same Day should be Tidak Aktif"
             assert row_vals[36] == "Aktif", "Reguler Cashless should be Aktif"
-            assert row_vals[37] == "Nonaktif", "Hemat Kargo should be Nonaktif"
-            assert row_vals[38] == "Nonaktif", "Indopaket should be Nonaktif"
+            assert row_vals[37] == "Tidak Aktif", "Hemat Kargo should be Tidak Aktif"
+            assert row_vals[38] == "Tidak Aktif", "Indopaket should be Tidak Aktif"
+            assert row_vals[9] == "No (ID)", f"Dangerous goods should be No (ID): {row_vals[9]}"
             
             # Handle parent/variation transitions
             parent_sku = row_vals[8]
