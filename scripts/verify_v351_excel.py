@@ -34,10 +34,14 @@ def main():
         ).all()
         
         print(f"Found {len(test_sizes)} existing sizes for {test_product.sku}.")
-        # Set all of them to be active and priced
+        # Set all of them to be active and priced, and ensure they have at least one dummy image
+        from app.models.product import ProductSizeImage
         for s in test_sizes:
             s.selling_price = 25000.0
             s.is_archived = False
+            if not s.images:
+                dummy_img = ProductSizeImage(product_size_id=s.id, image_url="https://example.com/dummy.jpg")
+                s.images.append(dummy_img)
             
         db.flush()
             

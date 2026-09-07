@@ -418,7 +418,7 @@ def generate_shopee_bulk_upload(db: Session):
     all_valid_sizes = []
     for product in products:
         for size in product.sizes:
-            if not size.is_archived and size.selling_price is not None and size.selling_price > 0:
+            if not size.is_archived and size.selling_price is not None and size.selling_price > 0 and size.images:
                 all_valid_sizes.append(size)
                 
     size_ids = [s.id for s in all_valid_sizes]
@@ -428,7 +428,7 @@ def generate_shopee_bulk_upload(db: Session):
     for product in products:
         sizes = [
             s for s in product.sizes
-            if not s.is_archived and s.selling_price is not None and s.selling_price > 0
+            if not s.is_archived and s.selling_price is not None and s.selling_price > 0 and s.images
         ]
         if not sizes:
             continue
