@@ -390,25 +390,20 @@ def list_products(
 
 def generate_shopee_bulk_upload(db: Session):
     import io
-    import csv
     import os
     import openpyxl
-    from openpyxl import Workbook
+    from openpyxl import load_workbook
+    from openpyxl.worksheet.views import Pane
+    from openpyxl.descriptors.base import String
     
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Template"
+    # Monkey-patch openpyxl validation bug for activePane (e.g. 'top' instead of 'topLeft')
+    Pane.activePane = String(allow_none=True)
     
     base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    template_path = os.path.join(base_dir, "doc", "shopee", "templateShopeeBulk - Template.csv")
+    template_path = os.path.join(base_dir, "doc", "shopee", "Shopee_mass_upload_2026-09-07_basic_template.xlsx")
     
-    with open(template_path, "r", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        for row_idx, row in enumerate(reader, start=1):
-            if row_idx > 6:
-                break
-            for col_idx, value in enumerate(row, start=1):
-                ws.cell(row=row_idx, column=col_idx, value=value)
+    wb = load_workbook(template_path)
+    ws = wb["Template"]
                 
     products = (
         db.query(Product)
