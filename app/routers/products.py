@@ -492,6 +492,15 @@ Toleransi jahitan 0.5 - 1 cm.
 
 
 #scrunchie #scrunchiesilk #ikatrambut #aksesorishijab #ourascrunchie"""
+                elif category_lower == "pouch":
+                    col_3 = f"""An essential, refined for your everyday ritual ✨
+
+Pouch makeup dengan sentuhan elegan dan desain yang timeless, dirancang untuk melengkapi gaya kamu dengan effortless luxury.
+Dibuat dari konstruksi 3 lapis premium (inner lembut, dakron empuk, dan outer berkualitas) untuk menjaga setiap item tetap terlindungi dengan sempurna.
+
+Dilengkapi high quality zipper dengan finishing halus, memberikan pengalaman buka-tutup yang smooth dan durable.
+
+Ideal untuk menyimpan makeup, skincare, dan essentials kamu — whether for daily carry or a graceful getaway. 💖"""
                 else:
                     col_3 = (
                         f"Premium {product.name} berkualitas tinggi persembahan dari Oura Studio. "
