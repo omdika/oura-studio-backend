@@ -456,11 +456,48 @@ def generate_shopee_bulk_upload(db: Session):
             
             col_3 = ""
             if idx == 0:
-                col_3 = (
-                    f"Premium {product.name} berkualitas tinggi persembahan dari Oura Studio. "
-                    "Dibuat secara higienis, jahitan sangat rapi, menggunakan bahan pilihan terbaik "
-                    "yang nyaman dan modis untuk pemakaian sehari-hari."
-                )
+                if category_lower == "scrunchie":
+                    col_3 = f"""OURA - {product.name}
+
+Elegan, Lembut di Rambut, Anti Bekas
+
+
+
+DETAIL PRODUK:
+
+- BAHAN: Silk Printing Premium - Lembut, Licin, Glowing, Tidak Kusut
+
+- KARET: Karet kuat dan tidak mudah melar
+
+- JAHITAN: Rapi, Kuat, Tidak mudah lepas benang
+
+
+
+UKURAN:
+
+(Diameter diukur tanpa ditarik)
+
+L: 16.5 cm
+
+XL: 20 cm
+
+
+
+CATATAN:
+
+Warna di foto bisa beda 5-10% karena efek cahaya. 
+
+Toleransi jahitan 0.5 - 1 cm.
+
+
+
+#scrunchie #scrunchiesilk #ikatrambut #aksesorishijab #ourascrunchie"""
+                else:
+                    col_3 = (
+                        f"Premium {product.name} berkualitas tinggi persembahan dari Oura Studio. "
+                        "Dibuat secara higienis, jahitan sangat rapi, menggunakan bahan pilihan terbaik "
+                        "yang nyaman dan modis untuk pemakaian sehari-hari."
+                    )
                 
             col_4 = col_5 = col_6 = col_7 = col_8 = ""
             col_9 = product.sku if idx == 0 else ""
