@@ -5,6 +5,7 @@ __pycache__/
 .env
 .git/
 .claude/
-doc/*
-!doc/shopee/
+doc/versions/
+doc/*.md
+doc/*.txt
 docker-compose.yml
