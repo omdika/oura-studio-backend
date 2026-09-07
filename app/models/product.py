@@ -16,6 +16,7 @@ class Product(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     is_archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    category: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     sizes: Mapped[list["ProductSize"]] = relationship(back_populates="product")
 

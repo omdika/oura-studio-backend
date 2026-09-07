@@ -365,7 +365,7 @@ def create_product(body: ProductCreate, db: Session = Depends(get_db)):
     else:
         sku = _generate_unique_sku(db, body.name)
 
-    product = Product(sku=sku, name=body.name)
+    product = Product(sku=sku, name=body.name, category=body.category)
     db.add(product)
     db.commit()
     db.refresh(product)
@@ -388,11 +388,153 @@ def list_products(
     return q.order_by(Product.name).offset(offset).limit(limit).all()
 
 
+def generate_shopee_bulk_upload(db: Session):
+    import io
+    import csv
+    import os
+    import openpyxl
+    from openpyxl import Workbook
+    
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Template"
+    
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    template_path = os.path.join(base_dir, "doc", "shopee", "templateShopeeBulk - Template.csv")
+    
+    with open(template_path, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        for row_idx, row in enumerate(reader, start=1):
+            if row_idx > 6:
+                break
+            for col_idx, value in enumerate(row, start=1):
+                ws.cell(row=row_idx, column=col_idx, value=value)
+                
+    products = (
+        db.query(Product)
+        .filter(
+            Product.is_archived.is_(False),
+            Product.category.in_(["scrunchie", "pouch"])
+        )
+        .order_by(Product.name)
+        .all()
+    )
+    
+    all_valid_sizes = []
+    for product in products:
+        for size in product.sizes:
+            if not size.is_archived and size.selling_price is not None and size.selling_price > 0:
+                all_valid_sizes.append(size)
+                
+    size_ids = [s.id for s in all_valid_sizes]
+    stock_map = _stock_qty_map(db, size_ids)
+    
+    current_row = 7
+    for product in products:
+        sizes = [
+            s for s in product.sizes
+            if not s.is_archived and s.selling_price is not None and s.selling_price > 0
+        ]
+        if not sizes:
+            continue
+            
+        category_lower = (product.category or "").lower()
+        if category_lower == "scrunchie":
+            cat_code = "100146"
+            weight = 50
+            length, width, height = 10, 10, 2
+        elif category_lower == "pouch":
+            cat_code = "101650"
+            weight = 100
+            length, width, height = 15, 12, 5
+        else:
+            continue
+            
+        for idx, size in enumerate(sizes):
+            col_1 = cat_code
+            col_2 = product.name if idx == 0 else ""
+            
+            col_3 = ""
+            if idx == 0:
+                col_3 = (
+                    f"Premium {product.name} berkualitas tinggi persembahan dari Oura Studio. "
+                    "Dibuat secara higienis, jahitan sangat rapi, menggunakan bahan pilihan terbaik "
+                    "yang nyaman dan modis untuk pemakaian sehari-hari."
+                )
+                
+            col_4 = col_5 = col_6 = col_7 = col_8 = ""
+            col_9 = product.sku if idx == 0 else ""
+            col_10 = "No"
+            col_11 = product.sku
+            col_12 = "Ukuran"
+            
+            if size.fabric_variant_name:
+                col_13 = f"{size.size_label} - {size.fabric_variant_name}"
+            else:
+                col_13 = size.size_label
+                
+            col_14 = ""
+            if size.images:
+                col_14 = size.images[0].image_url
+                
+            col_15 = col_16 = ""
+            col_17 = size.selling_price
+            col_18 = stock_map.get(size.id, 0)
+            
+            if size.fabric_variant_name:
+                col_19 = f"{product.sku}-{size.size_label}-{size.fabric_variant_name}".upper()
+            else:
+                col_19 = f"{product.sku}-{size.size_label}".upper()
+                
+            col_20 = col_21 = col_22 = col_23 = col_24 = col_25 = col_26 = col_27 = col_28 = col_29 = col_30 = col_31 = ""
+            col_32 = weight
+            col_33 = length
+            col_34 = width
+            col_35 = height
+            
+            col_36 = "Nonaktif"
+            col_37 = "Aktif"
+            col_38 = "Nonaktif"
+            col_39 = "Nonaktif"
+            col_40 = ""
+            col_41 = ""
+            
+            row_data = [
+                col_1, col_2, col_3, col_4, col_5, col_6, col_7, col_8, col_9, col_10,
+                col_11, col_12, col_13, col_14, col_15, col_16, col_17, col_18, col_19, col_20,
+                col_21, col_22, col_23, col_24, col_25, col_26, col_27, col_28, col_29, col_30,
+                col_31, col_32, col_33, col_34, col_35, col_36, col_37, col_38, col_39, col_40, col_41
+            ]
+            
+            for col_idx, value in enumerate(row_data, start=1):
+                ws.cell(row=current_row, column=col_idx, value=value)
+                
+            current_row += 1
+            
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out
+
+
+@router.get("/products/shopee-bulk-upload")
+def get_shopee_bulk_upload(db: Session = Depends(get_db)):
+    from fastapi.responses import StreamingResponse
+    excel_stream = generate_shopee_bulk_upload(db)
+    return StreamingResponse(
+        excel_stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=shopee_mass_upload.xlsx"}
+    )
+
+
 @router.patch("/products/{sku}", response_model=ProductOut)
 def update_product(sku: str, body: ProductUpdate, db: Session = Depends(get_db)):
     product = _get_product_or_404(db, sku)
     if body.name is not None:
         product.name = body.name
+    if body.category is not None:
+        product.category = body.category if body.category else None
     _apply_is_archived(product, body.is_archived)
     db.commit()
     db.refresh(product)

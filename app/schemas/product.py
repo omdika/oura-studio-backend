@@ -7,11 +7,13 @@ from pydantic import BaseModel, ConfigDict, Field
 class ProductCreate(BaseModel):
     name: str
     sku: str | None = None
+    category: str | None = None
 
 
 class ProductUpdate(BaseModel):
     name: str | None = None
     is_archived: bool | None = None
+    category: str | None = None
 
 
 class ProductOut(BaseModel):
@@ -22,6 +24,7 @@ class ProductOut(BaseModel):
     name: str
     is_archived: bool
     created_at: datetime
+    category: str | None = None
 
 
 
