@@ -1018,10 +1018,9 @@ def get_stock_ledger(
     to_date: date = Query(..., alias="to"),
     db: Session = Depends(get_db)
 ):
-    from datetime import datetime, timedelta
-    start_dt = datetime.combine(from_date, datetime.min.time())
-    end_dt = datetime.combine(to_date, datetime.min.time()) + timedelta(days=1)
-    
+    from app.utils.timezone import get_wib_day_bounds
+    start_dt, end_dt = get_wib_day_bounds(from_date, to_date)
+
     entries = (
         db.query(StockLedger)
         .filter(StockLedger.created_at >= start_dt, StockLedger.created_at < end_dt)

@@ -137,10 +137,15 @@ def _fabric_usage_entries(
         .order_by(ProductionBatch.confirmed_at.desc())
     )
 
-    if from_date:
-        query = query.filter(func.date(ProductionBatch.confirmed_at) >= from_date)
-    if to_date:
-        query = query.filter(func.date(ProductionBatch.confirmed_at) <= to_date)
+    if from_date is not None or to_date is not None:
+        from app.utils.timezone import get_wib_day_bounds
+        start_date = from_date or date.min
+        end_date = to_date or date.max
+        start_utc, end_utc = get_wib_day_bounds(start_date, end_date)
+        if from_date is not None:
+            query = query.filter(ProductionBatch.confirmed_at >= start_utc)
+        if to_date is not None:
+            query = query.filter(ProductionBatch.confirmed_at < end_utc)
 
     query = query.limit(limit)
 
@@ -194,10 +199,15 @@ def _manual_usage_entries(
         .order_by(MaterialUsageLog.created_at.desc())
     )
 
-    if from_date:
-        query = query.filter(func.date(MaterialUsageLog.created_at) >= from_date)
-    if to_date:
-        query = query.filter(func.date(MaterialUsageLog.created_at) <= to_date)
+    if from_date is not None or to_date is not None:
+        from app.utils.timezone import get_wib_day_bounds
+        start_date = from_date or date.min
+        end_date = to_date or date.max
+        start_utc, end_utc = get_wib_day_bounds(start_date, end_date)
+        if from_date is not None:
+            query = query.filter(MaterialUsageLog.created_at >= start_utc)
+        if to_date is not None:
+            query = query.filter(MaterialUsageLog.created_at < end_utc)
 
     query = query.limit(limit)
 

@@ -22,6 +22,7 @@ from app.schemas.sales import (
 )
 from app.services.cutting_optimizer import estimate_fabric_cost_per_piece_from_rate
 from app.services.hpp import compute_hpp
+from app.utils.timezone import get_wib_day_bounds
 
 router = APIRouter(prefix="/sales-orders", tags=["sales"], dependencies=[Depends(get_current_owner)])
 
@@ -309,13 +310,15 @@ def list_sales_orders(
     q = db.query(SalesOrder).options(joinedload(SalesOrder.items))
     if status_filter is not None:
         q = q.filter(SalesOrder.status == status_filter)
-    if from_ is not None:
-        start = datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc)
-        q = q.filter(SalesOrder.sold_at >= start)
-    if to is not None:
-        end = datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1)
-        q = q.filter(SalesOrder.sold_at < end)
-        
+    if from_ is not None or to is not None:
+        start_date = from_ or date.min
+        end_date = to or date.max
+        start_utc, end_utc = get_wib_day_bounds(start_date, end_date)
+        if from_ is not None:
+            q = q.filter(SalesOrder.sold_at >= start_utc)
+        if to is not None:
+            q = q.filter(SalesOrder.sold_at < end_utc)
+
     orders = q.order_by(SalesOrder.sold_at.desc()).offset(offset).limit(limit).all()
     return _orders_out(db, orders)
 

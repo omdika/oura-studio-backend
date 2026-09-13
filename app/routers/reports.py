@@ -27,6 +27,7 @@ from app.schemas.reports import (
 )
 from app.services.pricing import compute_margin_pct
 from app.services.reports import bucket_start
+from app.utils.timezone import WIB, get_wib_day_bounds, get_wib_month_start_bounds, get_wib_today_bounds
 
 router = APIRouter(prefix="/reports", tags=["reports"], dependencies=[Depends(get_current_owner)])
 
@@ -67,12 +68,8 @@ def _low_stock_alerts(db: Session) -> list[LowStockAlert]:
 
 @router.get("/dashboard", response_model=DashboardResponse)
 def dashboard(db: Session = Depends(get_db)):
-    # "today"/"this month" per server timezone -- this server runs in UTC (Cloud Run default, no
-    # TZ config exists anywhere else in this app), so UTC is literally the server timezone here.
-    today = datetime.now(timezone.utc).date()
-    day_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
-    day_end = day_start + timedelta(days=1)
-    month_start = day_start.replace(day=1)
+    day_start, day_end, _ = get_wib_today_bounds()
+    month_start, _, _ = get_wib_month_start_bounds()
 
     today_orders = (
         db.query(SalesOrder)
@@ -165,8 +162,7 @@ def sales_report(
     if from_ > to:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from must be <= to")
 
-    start = datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc)
-    end = datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1)
+    start, end = get_wib_day_bounds(from_, to)
 
     orders = (
         db.query(SalesOrder)
@@ -177,7 +173,8 @@ def sales_report(
 
     buckets: dict[date, dict] = defaultdict(lambda: {"revenue": 0.0, "profit": 0.0, "orders": 0})
     for order in orders:
-        key = bucket_start(order.sold_at.date(), group_by)
+        sold_at_wib = order.sold_at.astimezone(WIB)
+        key = bucket_start(sold_at_wib.date(), group_by)
         buckets[key]["orders"] += 1
         for item in order.items:
             buckets[key]["revenue"] += (item.unit_price - item.discount) * item.qty
@@ -291,13 +288,14 @@ def waste_by_material(
         .join(MaterialPurchase, CuttingLayout.material_purchase_id == MaterialPurchase.id)
         .filter(CuttingLayout.status == "used")
     )
-    if from_ is not None:
-        q = q.filter(CuttingLayout.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc))
-    if to is not None:
-        q = q.filter(
-            CuttingLayout.created_at
-            < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1)
-        )
+    if from_ is not None or to is not None:
+        start_date = from_ or date.min
+        end_date = to or date.max
+        start_utc, end_utc = get_wib_day_bounds(start_date, end_date)
+        if from_ is not None:
+            q = q.filter(CuttingLayout.created_at >= start_utc)
+        if to is not None:
+            q = q.filter(CuttingLayout.created_at < end_utc)
     layouts = q.all()
 
     by_material: dict[uuid.UUID, list[float]] = defaultdict(list)
@@ -337,8 +335,7 @@ def product_sales_ranking(
     if from_ > to:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from must be <= to")
 
-    start = datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc)
-    end = datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1)
+    start, end = get_wib_day_bounds(from_, to)
 
     from sqlalchemy import func
 
