@@ -1,3 +1,4 @@
+import math
 import uuid
 from collections import defaultdict
 
@@ -20,6 +21,7 @@ from app.schemas.product import (
     DeleteResultOut,
     HppBreakdownOut,
     HppLineItemOut,
+    PaginatedResponse,
     PriceAdvisorRequest,
     PriceAdvisorResponse,
     ProductCreate,
@@ -372,12 +374,12 @@ def create_product(body: ProductCreate, db: Session = Depends(get_db)):
     return product
 
 
-@router.get("/products", response_model=list[ProductOut])
+@router.get("/products", response_model=PaginatedResponse[ProductOut])
 def list_products(
     include_archived: bool = False,
     search: str | None = None,
-    limit: int = Query(default=200, le=500),
-    offset: int = 0,
+    page: int = Query(1, ge=1, description="Nomor halaman untuk pagination"),
+    limit: int = Query(50, ge=1, le=500, description="Jumlah item per halaman"),
     db: Session = Depends(get_db),
 ):
     q = db.query(Product)
@@ -385,7 +387,23 @@ def list_products(
         q = q.filter(Product.is_archived.is_(False))
     if search:
         q = q.filter(Product.name.ilike(f"%{search}%"))
-    return q.order_by(Product.name).offset(offset).limit(limit).all()
+
+    total_items = q.count()
+    total_pages = math.ceil(total_items / limit) if total_items > 0 else 1
+    offset = (page - 1) * limit
+    items = q.order_by(Product.name).offset(offset).limit(limit).all()
+
+    next_page = page + 1 if page < total_pages else None
+    prev_page = page - 1 if page > 1 else None
+
+    return PaginatedResponse[ProductOut](
+        data=[ProductOut.model_validate(item) for item in items],
+        total_items=total_items,
+        total_pages=total_pages,
+        current_page=page,
+        next_page=next_page,
+        prev_page=prev_page,
+    )
 
 
 def generate_shopee_bulk_upload(db: Session):
@@ -716,22 +734,37 @@ def get_product_size(sku: str, size_id: uuid.UUID, db: Session = Depends(get_db)
 
 
 
-@router.get("/product-sizes", response_model=list[ProductSizeWithProductOut])
+@router.get("/product-sizes", response_model=PaginatedResponse[ProductSizeWithProductOut])
 def list_all_product_sizes(
     archived: bool = False,
+    page: int = Query(1, ge=1, description="Nomor halaman untuk pagination"),
+    limit: int = Query(50, ge=1, le=500, description="Jumlah item per halaman"),
+    product_id: uuid.UUID | None = Query(None, description="Filter ukuran berdasarkan ID produk"),
     db: Session = Depends(get_db),
 ):
-    """v3.22: Optimized bulk endpoint to fetch all sizes across all active products in a single call,
-    completely resolving the N+1 HTTP request bottleneck on the iOS client.
+    """v3.22 / v3.56: Bulk endpoint to fetch sizes with pagination,
+    resolving N+1 HTTP bottlenecks and large payload delays.
     """
-    sizes = (
+    q = (
         db.query(ProductSize)
         .options(joinedload(ProductSize.product))
         .join(Product, ProductSize.product_id == Product.id)
         .filter(ProductSize.is_archived == archived, Product.is_archived.is_(False))
-        .order_by(Product.name, ProductSize.size_label)
+    )
+    if product_id is not None:
+        q = q.filter(ProductSize.product_id == product_id)
+
+    total_items = q.count()
+    total_pages = math.ceil(total_items / limit) if total_items > 0 else 1
+    offset = (page - 1) * limit
+
+    sizes = (
+        q.order_by(Product.name, ProductSize.size_label)
+        .offset(offset)
+        .limit(limit)
         .all()
     )
+
     size_ids = [s.id for s in sizes]
     stock_map = _stock_qty_map(db, size_ids)
     breakdown_map = _stock_breakdown_map(db, size_ids)
@@ -740,7 +773,7 @@ def list_all_product_sizes(
     fabric_map = _fabric_items_map(db, batch_ids)
     hardware_map = _hardware_items_map(db, size_ids)
 
-    return [
+    data = [
         ProductSizeWithProductOut(
             id=s.id,
             product_id=s.product_id,
@@ -772,6 +805,18 @@ def list_all_product_sizes(
         )
         for s in sizes
     ]
+
+    next_page = page + 1 if page < total_pages else None
+    prev_page = page - 1 if page > 1 else None
+
+    return PaginatedResponse[ProductSizeWithProductOut](
+        data=data,
+        total_items=total_items,
+        total_pages=total_pages,
+        current_page=page,
+        next_page=next_page,
+        prev_page=prev_page,
+    )
 
 
 @router.get("/product-sizes/{size_id}", response_model=ProductSizeWithProductOut)

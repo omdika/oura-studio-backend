@@ -1,7 +1,20 @@
 import uuid
 from datetime import datetime
+from typing import Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
+
+T = TypeVar("T")
+
+
+class PaginatedResponse(BaseModel, Generic[T]):
+    data: list[T]
+    total_items: int
+    total_pages: int
+    current_page: int
+    next_page: int | None = None
+    prev_page: int | None = None
+
 
 
 class ProductCreate(BaseModel):
