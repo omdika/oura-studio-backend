@@ -10,7 +10,7 @@ class Setting(Base):
     __tablename__ = "settings"
 
     key: Mapped[str] = mapped_column(Text, primary_key=True)
-    value: Mapped[float] = mapped_column(Numeric(asdecimal=False), nullable=False)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

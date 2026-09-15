@@ -10,6 +10,7 @@ from app.deps import get_current_owner
 from app.models.material import Material
 from app.models.pattern import PatternComponent, PatternSpec
 from app.models.product import Product, ProductSize
+from app.models.settings import Setting
 from app.models.sales import SalesOrder, SalesOrderItem
 from app.models.settings import Setting
 from app.models.stock import StockLedger
@@ -54,6 +55,15 @@ def _size_display_map(db: Session, product_size_ids: list[uuid.UUID]) -> dict[uu
             size_label = f"{size_label} · {size.fabric_variant_name}"
         result[size.id] = (product_name, size_label)
     return result
+
+
+def _get_event_price_adjustment(db: Session) -> tuple[bool, int]:
+    active_setting = db.query(Setting).filter(Setting.key == "event_price_adjustment_active").first()
+    amount_setting = db.query(Setting).filter(Setting.key == "event_price_adjustment_amount").first()
+
+    is_active = active_setting.value == "true" if active_setting else False
+    amount = int(amount_setting.value) if amount_setting and amount_setting.value.isdigit() else 0
+    return is_active, amount
 
 
 def _item_out(item: SalesOrderItem, size_map: dict[uuid.UUID, tuple[str, str]]) -> SalesOrderItemOut:
@@ -257,8 +267,19 @@ def create_sales_order(body: SalesOrderCreate, db: Session = Depends(get_db)):
 
         hpp_snapshot, hpp_source = get_hpp_for_sale(db, size.id)
 
-        line_profit = (line.unit_price - line.discount - hpp_snapshot) * line.qty
-        resolved_items.append((line, hpp_snapshot, hpp_source, line_profit))
+        is_active, adjustment_amount = _get_event_price_adjustment(db)
+        if is_active and size.selling_price is not None:
+            final_selling_price = size.selling_price + adjustment_amount
+        else:
+            final_selling_price = size.selling_price
+
+        # If the sales item has a unit_price specified, use that. Otherwise, use the adjusted product size selling price.
+        # If both are None, default to 0 for profit calculation.
+        effective_selling_price = line.unit_price if line.unit_price is not None else final_selling_price
+        effective_selling_price = effective_selling_price if effective_selling_price is not None else 0.0
+
+        line_profit = (effective_selling_price - line.discount - hpp_snapshot) * line.qty
+        resolved_items.append((line, hpp_snapshot, hpp_source, line_profit, effective_selling_price))
 
     order = SalesOrder(
         invoice_no=_generate_invoice_no(db),
@@ -270,13 +291,13 @@ def create_sales_order(body: SalesOrderCreate, db: Session = Depends(get_db)):
     db.add(order)
     db.flush()
 
-    for line, hpp_snapshot, hpp_source, line_profit in resolved_items:
+    for line, hpp_snapshot, hpp_source, line_profit, effective_selling_price in resolved_items:
         db.add(
             SalesOrderItem(
                 sales_order_id=order.id,
                 product_size_id=line.product_size_id,
                 qty=line.qty,
-                unit_price=line.unit_price,
+                unit_price=effective_selling_price, # Store the effective selling price after adjustment
                 discount=line.discount,
                 unit_hpp_snapshot=hpp_snapshot,
                 hpp_source=hpp_source,

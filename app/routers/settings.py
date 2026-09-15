@@ -16,6 +16,11 @@ def list_settings(db: Session = Depends(get_db)):
 
 @router.patch("", response_model=SettingOut)
 def upsert_setting(body: SettingUpsert, db: Session = Depends(get_db)):
+    if body.key == "event_price_adjustment_amount" and not (body.value.isdigit() and int(body.value) >= 0):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Adjustment amount must be a non-negative integer")
+    if body.key == "event_price_adjustment_active" and body.value not in ["true", "false"]:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Active status must be 'true' or 'false'")
+
     setting = db.get(Setting, body.key)
     if setting is None:
         setting = Setting(key=body.key, value=body.value)

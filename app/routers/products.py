@@ -13,9 +13,10 @@ from app.models.cutting import CuttingLayout, CuttingLayoutItem
 from app.models.material import Material, MaterialPurchase, MaterialUsageLog
 from app.models.pattern import PatternComponent, PatternSpec
 from app.models.product import Product, ProductSize, ProductSizeImage
-from app.models.production import ProductionBatch, ProductionBatchItem, ProductionBatchLayout
+from app.models.settings import Setting
 from app.models.sales import SalesOrderItem
 from app.models.stock import StockLedger
+from app.models.settings import Setting
 from app.schemas.product import (
     AddStockFromBahanRequest,
     DeleteResultOut,
@@ -283,6 +284,15 @@ def _size_fields(size: ProductSize) -> dict:
     }
 
 
+def _get_event_price_adjustment(db: Session) -> tuple[bool, int]:
+    active_setting = db.query(Setting).filter(Setting.key == "event_price_adjustment_active").first()
+    amount_setting = db.query(Setting).filter(Setting.key == "event_price_adjustment_amount").first()
+
+    is_active = active_setting.value == "true" if active_setting else False
+    amount = int(amount_setting.value) if amount_setting and amount_setting.value.isdigit() else 0
+    return is_active, amount
+
+
 def _size_out(size: ProductSize, stock_qty: int, production_qty: int, manual_qty: int) -> ProductSizeOut:
     return ProductSizeOut(
         **_size_fields(size),
@@ -320,11 +330,16 @@ def _detail_out(
     fabric_items: list[HppLineItemOut],
     hardware_items: list[HppLineItemOut],
 ) -> ProductSizeDetailOut:
-    margin_pct = (
-        compute_margin_pct(size.selling_price, latest_item.hpp_total)
-        if size.selling_price is not None and latest_item is not None
-        else None
-    )
+    is_active, adjustment_amount = _get_event_price_adjustment(db)
+    if is_active and size.selling_price is not None:
+        final_selling_price = size.selling_price + adjustment_amount
+    else:
+        final_selling_price = size.selling_price
+
+    margin_pct = compute_margin_pct(final_selling_price, latest_item.hpp_total)
+            if final_selling_price is not None and latest_item is not None
+            else None
+
     return ProductSizeDetailOut(
         **_size_fields(size),
         current_stock_qty=stock_qty,
@@ -332,6 +347,7 @@ def _detail_out(
         manual_stock_qty=manual_qty,
         latest_hpp_breakdown=_hpp_breakdown_out(latest_item, fabric_items, hardware_items),
         margin_pct=margin_pct,
+        selling_price=final_selling_price
     )
 
 
@@ -780,7 +796,11 @@ def list_all_product_sizes(
             size_label=s.size_label,
             fabric_variant_name=s.fabric_variant_name,
             reorder_min_qty=s.reorder_min_qty,
-            selling_price=s.selling_price,
+    is_active, adjustment_amount = _get_event_price_adjustment(db)
+    if is_active and s.selling_price is not None:
+        final_selling_price = s.selling_price + adjustment_amount
+    else:
+        final_selling_price = s.selling_price
             is_archived=s.is_archived,
             manual_hpp_fabric=s.manual_hpp_fabric,
             manual_hpp_pooled=s.manual_hpp_pooled,
@@ -797,11 +817,15 @@ def list_all_product_sizes(
                 fabric_map.get((hpp_map[s.id].production_batch_id, s.id), []) if s.id in hpp_map else [],
                 hardware_map.get(s.id, []),
             ),
-            margin_pct=compute_margin_pct(s.selling_price, hpp_map[s.id].hpp_total)
-                if s.selling_price is not None and s.id in hpp_map and hpp_map[s.id] is not None
+            margin_pct=compute_margin_pct(
+                final_selling_price,
+                hpp_map[s.id].hpp_total
+            )
+                if (final_selling_price is not None) and s.id in hpp_map and hpp_map[s.id] is not None
                 else None,
             product_sku=s.product.sku,
             product_name=s.product.name,
+            selling_price=final_selling_price,
         )
         for s in sizes
     ]
