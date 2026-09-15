@@ -129,6 +129,8 @@ def _stock_breakdown(db: Session, product_size_id: uuid.UUID) -> tuple[int, int]
     return _stock_breakdown_map(db, [product_size_id]).get(product_size_id, (0, 0))
 
 
+from app.models.production import ProductionBatch, ProductionBatchItem
+
 def _latest_production_item(db: Session, product_size_id: uuid.UUID) -> ProductionBatchItem | None:
     # Must filter status='confirmed' -- draft items always have hpp_*=0 (not computed until
     # confirm, per handoff Production section), so an unfiltered "latest by produced_at" can
@@ -336,9 +338,11 @@ def _detail_out(
     else:
         final_selling_price = size.selling_price
 
-    margin_pct = compute_margin_pct(final_selling_price, latest_item.hpp_total)
-            if final_selling_price is not None and latest_item is not None
-            else None
+    margin_pct = (
+        compute_margin_pct(final_selling_price, latest_item.hpp_total)
+        if final_selling_price is not None and latest_item is not None
+        else None
+    )
 
     return ProductSizeDetailOut(
         **_size_fields(size),
@@ -789,6 +793,8 @@ def list_all_product_sizes(
     fabric_map = _fabric_items_map(db, batch_ids)
     hardware_map = _hardware_items_map(db, size_ids)
 
+    is_active, adjustment_amount = _get_event_price_adjustment(db)
+
     data = [
         ProductSizeWithProductOut(
             id=s.id,
@@ -796,11 +802,9 @@ def list_all_product_sizes(
             size_label=s.size_label,
             fabric_variant_name=s.fabric_variant_name,
             reorder_min_qty=s.reorder_min_qty,
-    is_active, adjustment_amount = _get_event_price_adjustment(db)
-    if is_active and s.selling_price is not None:
-        final_selling_price = s.selling_price + adjustment_amount
-    else:
-        final_selling_price = s.selling_price
+            selling_price=(s.selling_price + adjustment_amount
+                           if is_active and s.selling_price is not None
+                           else s.selling_price),
             is_archived=s.is_archived,
             manual_hpp_fabric=s.manual_hpp_fabric,
             manual_hpp_pooled=s.manual_hpp_pooled,
@@ -825,7 +829,6 @@ def list_all_product_sizes(
                 else None,
             product_sku=s.product.sku,
             product_name=s.product.name,
-            selling_price=final_selling_price,
         )
         for s in sizes
     ]

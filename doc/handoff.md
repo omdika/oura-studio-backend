@@ -14,6 +14,7 @@ This doc is structured for three audiences reading in parallel:
 
 | Version | Date | Changed by | Summary |
 |---|---|---|---|
+| v3.58 | 2026-09-15 | Fullstack | **SPECIFIED: Intercept Harga Event (Temporary Price Adjustment).** Menambahkan fungsionalitas untuk menyesuaikan harga jual produk secara sementara untuk event tertentu melalui pengaturan, yang akan mempengaruhi tampilan harga di daftar produk dan harga yang tersimpan saat pencatatan penjualan. Rincian spesifikasi: `doc/versions/v3.58.md`. |
 | v3.56 | 2026-09-14 | Fullstack | **PLANNED: Perbaikan Performa Load Data Produk.** Mengimplementasikan pagination (lazy loading) di ProdukListView untuk endpoint produk dan ukuran, serta mengoptimasi performa backend dan ukuran payload data. Rincian spesifikasi: `doc/versions/v3.56.md` |
 | v3.55 | 2026-09-13 | Fullstack | **PLANNED: Penyelarasan Timezone GMT+0 vs GMT+7 (WIB) pada Query Filter Tanggal & Dashboard.** Menyelaraskan seluruh boundary query tanggal (`from` & `to`) dan perhitungan `today`/`month_start` di backend FastAPI agar dikonversi ke rentang waktu WIB (UTC+7) terpusat via `app/utils/timezone.py`, mencegah transaksi UTC malam hari tereliminasi dari filter tanggal kalender lokal. Rincian spesifikasi: `doc/versions/v3.55.md` |
 | v3.50 | 2026-09-05 | Fullstack | **PLANNED: Multi-Image Upload ke GCS per Ukuran.** Menyusun rencana arsitektur FastAPI Proxy secure upload ke Google Cloud Storage, skema tabel `product_size_image` (1-to-many), mekanisme kompresi biner dinamis client-side di bawah 1.8 MB (JPEG), dan integrasi PhotosPicker di ProdukSizeDetailView. Rincian spesifikasi: `doc/versions/v3.50.md` |
@@ -913,6 +914,7 @@ Prompted by finding that `MaterialPurchase` had create fully spec'd but edit/del
 
 | Entity | Create | Edit | Delete |
 |---|---|---|---|
+| v3.58 | 2026-09-15 | Fullstack | **SPECIFIED: Intercept Harga Event (Temporary Price Adjustment).** Menambahkan fungsionalitas untuk menyesuaikan harga jual produk secara sementara untuk event tertentu melalui pengaturan, yang akan mempengaruhi tampilan harga di daftar produk dan harga yang tersimpan saat pencatatan penjualan. Rincian spesifikasi: `doc/versions/v3.58.md`. |
 | Material | ✅ inline via first purchase | ✅ `PATCH /materials/{id}` (name, reorder_min_qty, etc.) | **No hard delete.** Added `is_archived` flag — see below. |
 | MaterialPurchase | ✅ spec'd earlier | ✅ full if unused, cost/date/supplier-only if consumed — spec'd earlier | ✅ if unused / 🚫 blocked (409) if consumed — spec'd earlier |
 | Supplier | ✅ inline via purchase, or `POST /suppliers` | ⚠️ was missing — added `PATCH /suppliers/{id}` below | ⚠️ was missing — added below, allowed only if unused |
