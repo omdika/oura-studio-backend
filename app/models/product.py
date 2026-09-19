@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Numeric, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -23,7 +23,10 @@ class Product(Base):
 
 class ProductSize(Base):
     __tablename__ = "product_size"
-    __table_args__ = (UniqueConstraint("product_id", "size_label", "fabric_variant_name"),)
+    __table_args__ = (
+        UniqueConstraint("product_id", "size_label", "fabric_variant_name"),
+        Index("ix_product_size_product_id", "product_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("product.id"), nullable=False)

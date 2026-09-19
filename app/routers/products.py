@@ -69,6 +69,31 @@ def _get_size_or_404(db: Session, product: Product, size_id: uuid.UUID) -> Produ
     return size
 
 
+def _get_product_and_size_or_404(db: Session, sku: str, size_id: uuid.UUID) -> tuple[Product, ProductSize]:
+    """v3.57 perf: single round-trip for the common product+size lookup.
+
+    Replaces the 2-query pattern `_get_product_or_404` + `_get_size_or_404` used by
+    PATCH and stock-from-bahan. Single JOIN query instead of two sequential
+    SELECTs saves ~100ms cross-region RTT.
+    """
+    size = (
+        db.query(ProductSize)
+        .join(Product, ProductSize.product_id == Product.id)
+        .filter(ProductSize.id == size_id, Product.sku == sku)
+        .first()
+    )
+    if size is not None:
+        product = db.get(Product, size.product_id)
+        # product must exist since FK enforces it; fallback to extra query only if needed
+        if product is None:
+            product = db.query(Product).filter(Product.sku == sku).first()
+        return product, size
+    # Distinguish missing product vs missing size for correct 404 detail
+    if db.query(Product).filter(Product.sku == sku).first() is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product size not found")
+
+
 def _generate_unique_sku(db: Session, name: str) -> str:
     # Section 2 spec: SKU auto-fills as an UPPERCASE slug (e.g. "Pouch Serut" -> "POUCH-SERUT").
     # python-slugify 8.0.4 has no `uppercase` kwarg (renamed to `lowercase`, default True) --
@@ -126,6 +151,54 @@ def _stock_breakdown_map(db: Session, product_size_ids: list[uuid.UUID]) -> dict
 
 def _stock_breakdown(db: Session, product_size_id: uuid.UUID) -> tuple[int, int]:
     return _stock_breakdown_map(db, [product_size_id]).get(product_size_id, (0, 0))
+
+
+def _stock_aggregates(db: Session, product_size_id: uuid.UUID) -> tuple[int, int, int]:
+    """v3.57 perf: single query for total + breakdown.
+
+    Previously PATCH did `_current_stock_qty` + `_stock_breakdown` as two separate
+    SELECT SUM(...) queries (2 round-trips, 2 seq scans without index).
+    One query returns (total, production, manual) together.
+    """
+    production_case = case((StockLedger.reason == "production", StockLedger.change_qty), else_=0)
+    manual_case = case((StockLedger.reason.in_(["initial", "adjustment"]), StockLedger.change_qty), else_=0)
+    row = (
+        db.query(
+            func.coalesce(func.sum(StockLedger.change_qty), 0),
+            func.coalesce(func.sum(production_case), 0),
+            func.coalesce(func.sum(manual_case), 0),
+        )
+        .filter(StockLedger.product_size_id == product_size_id)
+        .first()
+    )
+    if row is None:
+        return (0, 0, 0)
+    return (int(row[0]), int(row[1]), int(row[2]))
+
+
+def _stock_all_map(db: Session, product_size_ids: list[uuid.UUID]) -> dict[uuid.UUID, tuple[int, int, int]]:
+    """v3.57 perf: batched total + breakdown in one query for list endpoints.
+
+    Replaces the 2-query pattern `_stock_qty_map` + `_stock_breakdown_map`.
+    Kept separate from the two legacy helpers for backward compat in case callers
+    still use them, but new code should prefer this.
+    """
+    if not product_size_ids:
+        return {}
+    production_case = case((StockLedger.reason == "production", StockLedger.change_qty), else_=0)
+    manual_case = case((StockLedger.reason.in_(["initial", "adjustment"]), StockLedger.change_qty), else_=0)
+    rows = (
+        db.query(
+            StockLedger.product_size_id,
+            func.coalesce(func.sum(StockLedger.change_qty), 0),
+            func.coalesce(func.sum(production_case), 0),
+            func.coalesce(func.sum(manual_case), 0),
+        )
+        .filter(StockLedger.product_size_id.in_(product_size_ids))
+        .group_by(StockLedger.product_size_id)
+        .all()
+    )
+    return {row[0]: (int(row[1]), int(row[2]), int(row[3])) for row in rows}
 
 
 def _latest_production_item(db: Session, product_size_id: uuid.UUID) -> ProductionBatchItem | None:
@@ -336,8 +409,7 @@ def _detail_out(
 
 
 def _size_detail_out(db: Session, size: ProductSize) -> ProductSizeDetailOut:
-    stock_qty = _current_stock_qty(db, size.id)
-    production_qty, manual_qty = _stock_breakdown(db, size.id)
+    stock_qty, production_qty, manual_qty = _stock_aggregates(db, size.id)
     latest_item = _latest_production_item(db, size.id)
     fabric_items: list[HppLineItemOut] = []
     hardware_items: list[HppLineItemOut] = []
@@ -703,8 +775,7 @@ def list_product_sizes(
         .all()
     )
     size_ids = [s.id for s in sizes]
-    stock_map = _stock_qty_map(db, size_ids)
-    breakdown_map = _stock_breakdown_map(db, size_ids)
+    stock_all = _stock_all_map(db, size_ids)
     hpp_map = _latest_hpp_map(db, size_ids)
     batch_ids = [item.production_batch_id for item in hpp_map.values()]
     fabric_map = _fabric_items_map(db, batch_ids)
@@ -712,8 +783,9 @@ def list_product_sizes(
     out = [
         _detail_out(
             s,
-            stock_map.get(s.id, 0),
-            *breakdown_map.get(s.id, (0, 0)),
+            stock_all.get(s.id, (0, 0, 0))[0],
+            stock_all.get(s.id, (0, 0, 0))[1],
+            stock_all.get(s.id, (0, 0, 0))[2],
             hpp_map.get(s.id),
             fabric_map.get((hpp_map[s.id].production_batch_id, s.id), []) if s.id in hpp_map else [],
             hardware_map.get(s.id, []),
@@ -727,8 +799,7 @@ def list_product_sizes(
 
 @router.get("/products/{sku}/sizes/{size_id}", response_model=ProductSizeDetailOut)
 def get_product_size(sku: str, size_id: uuid.UUID, db: Session = Depends(get_db)):
-    product = _get_product_or_404(db, sku)
-    size = _get_size_or_404(db, product, size_id)
+    product, size = _get_product_and_size_or_404(db, sku, size_id)
     return _size_detail_out(db, size)
 
 
@@ -766,8 +837,7 @@ def list_all_product_sizes(
     )
 
     size_ids = [s.id for s in sizes]
-    stock_map = _stock_qty_map(db, size_ids)
-    breakdown_map = _stock_breakdown_map(db, size_ids)
+    stock_all = _stock_all_map(db, size_ids)
     hpp_map = _latest_hpp_map(db, size_ids)
     batch_ids = [item.production_batch_id for item in hpp_map.values()]
     fabric_map = _fabric_items_map(db, batch_ids)
@@ -789,9 +859,9 @@ def list_all_product_sizes(
             manual_hpp_overhead=s.manual_hpp_overhead,
             manual_hpp_total=s.manual_hpp_total,
             images=s.images,
-            current_stock_qty=stock_map.get(s.id, 0),
-            production_stock_qty=breakdown_map.get(s.id, (0, 0))[0],
-            manual_stock_qty=breakdown_map.get(s.id, (0, 0))[1],
+            current_stock_qty=stock_all.get(s.id, (0, 0, 0))[0],
+            production_stock_qty=stock_all.get(s.id, (0, 0, 0))[1],
+            manual_stock_qty=stock_all.get(s.id, (0, 0, 0))[2],
             latest_hpp_breakdown=_hpp_breakdown_out(
                 hpp_map.get(s.id),
                 fabric_map.get((hpp_map[s.id].production_batch_id, s.id), []) if s.id in hpp_map else [],
@@ -834,8 +904,7 @@ def get_product_size_by_id(size_id: uuid.UUID, db: Session = Depends(get_db)):
 
 @router.patch("/products/{sku}/sizes/{size_id}", response_model=ProductSizeOut)
 def update_product_size(sku: str, size_id: uuid.UUID, body: ProductSizeUpdate, db: Session = Depends(get_db)):
-    product = _get_product_or_404(db, sku)
-    size = _get_size_or_404(db, product, size_id)
+    product, size = _get_product_and_size_or_404(db, sku, size_id)
 
     if body.selling_price is not None:
         size.selling_price = body.selling_price
@@ -855,8 +924,8 @@ def update_product_size(sku: str, size_id: uuid.UUID, body: ProductSizeUpdate, d
 
     db.commit()
     db.refresh(size)
-    production_qty, manual_qty = _stock_breakdown(db, size.id)
-    return _size_out(size, _current_stock_qty(db, size.id), production_qty, manual_qty)
+    total_qty, production_qty, manual_qty = _stock_aggregates(db, size.id)
+    return _size_out(size, total_qty, production_qty, manual_qty)
 
 
 @router.delete("/products/{sku}/sizes/{size_id}", response_model=DeleteResultOut)
@@ -947,8 +1016,7 @@ def add_stock_from_bahan(sku: str, size_id: uuid.UUID, body: AddStockFromBahanRe
     pipeline entirely. Now writes one MaterialUsageLog row per purchase actually deducted from,
     which routers/materials.py's get_material_usage() merges into the same response.
     """
-    product = _get_product_or_404(db, sku)
-    size = _get_size_or_404(db, product, size_id)
+    product, size = _get_product_and_size_or_404(db, sku, size_id)
 
     if body.spec_id is not None:
         spec = db.get(PatternSpec, body.spec_id)

@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -10,6 +10,10 @@ from app.database import Base
 
 class ProductionBatch(Base):
     __tablename__ = "production_batch"
+    __table_args__ = (
+        Index("ix_production_batch_status", "status"),
+        Index("ix_production_batch_confirmed_at", "confirmed_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     produced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -48,6 +52,10 @@ class ProductionBatchLayout(Base):
 
 class ProductionBatchItem(Base):
     __tablename__ = "production_batch_item"
+    __table_args__ = (
+        Index("ix_pbi_product_size_id", "product_size_id"),
+        Index("ix_pbi_batch_id", "production_batch_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     production_batch_id: Mapped[uuid.UUID] = mapped_column(

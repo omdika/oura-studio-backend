@@ -3,6 +3,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
@@ -248,9 +249,15 @@ def _fifo_deduct_hardware(db: Session, material_id: uuid.UUID, qty_needed: float
     in services/material_cost.py for the same caveat on mixed history.
     """
     remaining = qty_needed
+    # v3.57 perf: filter to purchases with positive remaining so we don't load
+    # every historical purchase (incl. fully-consumed) when ledger is large.
+    # Uses the new ix_material_purchase_material_purchased index.
     purchases = (
         db.query(MaterialPurchase)
-        .filter(MaterialPurchase.material_id == material_id)
+        .filter(
+            MaterialPurchase.material_id == material_id,
+            or_(MaterialPurchase.remaining_length_cm > 0, MaterialPurchase.remaining_qty > 0),
+        )
         .order_by(MaterialPurchase.purchased_at.asc(), MaterialPurchase.created_at.asc())
         .all()
     )
