@@ -922,6 +922,17 @@ def update_product_size(sku: str, size_id: uuid.UUID, body: ProductSizeUpdate, d
         size.manual_hpp_overhead = body.manual_hpp_overhead
     _apply_is_archived(size, body.is_archived)
 
+    # v3.57b: combined stock adjustment — avoids extra POST + GET round-trips
+    if body.adjust_stock_by is not None and body.adjust_stock_by != 0:
+        reason = body.adjust_stock_reason or "adjustment"
+        entry = StockLedger(
+            product_size_id=size.id,
+            change_qty=body.adjust_stock_by,
+            reason=reason,
+            note=body.adjust_stock_note,
+        )
+        db.add(entry)
+
     db.commit()
     db.refresh(size)
     total_qty, production_qty, manual_qty = _stock_aggregates(db, size.id)

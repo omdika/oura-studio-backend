@@ -67,6 +67,12 @@ class ProductSizeUpdate(BaseModel):
     manual_hpp_hardware: float | None = None
     manual_hpp_labor: float | None = None
     manual_hpp_overhead: float | None = None
+    # v3.57b: combined stock adjustment in same PATCH to avoid extra round-trip
+    # (frontend previously did PATCH + POST /stock/adjustments + GET detail = 3 calls).
+    # If provided and !=0, creates a stock_ledger row in the same transaction.
+    adjust_stock_by: int | None = None
+    adjust_stock_reason: str | None = None  # default "adjustment" if adjust_stock_by is set
+    adjust_stock_note: str | None = None
 
 
 class ProductSizeOut(BaseModel):
