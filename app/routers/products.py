@@ -12,7 +12,7 @@ from app.deps import get_current_owner
 from app.models.cutting import CuttingLayout, CuttingLayoutItem
 from app.models.material import Material, MaterialPurchase, MaterialUsageLog
 from app.models.pattern import PatternComponent, PatternSpec
-from app.models.product import Product, ProductSize, ProductSizeImage
+from app.models.product import Product, ProductImage, ProductSize, ProductSizeImage
 from app.models.production import ProductionBatch, ProductionBatchItem, ProductionBatchLayout
 from app.models.sales import SalesOrderItem
 from app.models.stock import StockLedger
@@ -25,6 +25,8 @@ from app.schemas.product import (
     PriceAdvisorRequest,
     PriceAdvisorResponse,
     ProductCreate,
+    ProductImageOut,
+    ProductImagePatch,
     ProductOut,
     ProductSizeCreate,
     ProductSizeDetailOut,
@@ -33,6 +35,10 @@ from app.schemas.product import (
     ProductSizeWithProductOut,
     ProductSizeImageOut,
     ProductUpdate,
+    ShopeeModelOut,
+    ShopeePayloadOut,
+    SizeImageSelectOut,
+    SizeImageSelectRequest,
 )
 from app.routers.production import _fifo_deduct_hardware
 from app.routers.sales import get_hpp_for_sale
@@ -92,6 +98,98 @@ def _get_product_and_size_or_404(db: Session, sku: str, size_id: uuid.UUID) -> t
     if db.query(Product).filter(Product.sku == sku).first() is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product size not found")
+
+
+# ---------------------------------------------------------------------------
+# v3.62: Shopee gallery helpers (mirror iOS sizeLabelSortKey in ProdukDetailView)
+# ---------------------------------------------------------------------------
+
+_SIZE_ORDER = ["XXS", "XS", "S", "M", "L", "XL", "XXL", "XXXL"]
+_SIZE_ORDER_IDX = {label: idx for idx, label in enumerate(_SIZE_ORDER)}
+GALLERY_MAX = 9
+
+
+def _size_sort_key(label: str) -> tuple[int, str]:
+    idx = _SIZE_ORDER_IDX.get((label or "").upper())
+    if idx is not None:
+        return (idx, "")
+    return (len(_SIZE_ORDER), label or "")
+
+
+def _upload_jpeg_to_gcs(blob_name: str, file_bytes: bytes) -> str:
+    """Upload JPEG bytes to GCS, return public URL. Falls back to URL on error (dev)."""
+    from app.config import settings
+
+    bucket_name = settings.gcs_bucket_name.strip()
+    if bucket_name.startswith("gs://"):
+        bucket_name = bucket_name[5:]
+    if bucket_name.endswith("/"):
+        bucket_name = bucket_name[:-1]
+    try:
+        from google.cloud import storage
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        blob.upload_from_string(file_bytes, content_type="image/jpeg")
+        try:
+            blob.make_public()
+        except Exception as e:
+            print(f"GCS make_public failed: {e}. Normal if Uniform Bucket-Level Access is on.")
+        return f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+    except Exception as e:
+        print(f"GCS Upload failed: {e}. Falling back to expected GCS URL for development.")
+        return f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+
+
+def _gallery_ordered(db: Session, product_id: uuid.UUID) -> list[ProductImage]:
+    return (
+        db.query(ProductImage)
+        .filter(ProductImage.product_id == product_id)
+        .order_by(ProductImage.sort_order.asc())
+        .all()
+    )
+
+
+def _renumber_gallery(db: Session, product_id: uuid.UUID) -> list[ProductImage]:
+    """Normalize sort_order to 0..n-1 and keep is_cover == (sort_order == 0)."""
+    rows = _gallery_ordered(db, product_id)
+    for idx, row in enumerate(rows):
+        row.sort_order = idx
+        row.is_cover = (idx == 0)
+    db.flush()
+    return rows
+
+
+def _size_wakil_map(db: Session, size_ids: list[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """product_size_id -> image_url of the single selected Shopee wakil (if any)."""
+    if not size_ids:
+        return {}
+    rows = (
+        db.query(ProductSizeImage)
+        .filter(
+            ProductSizeImage.product_size_id.in_(size_ids),
+            ProductSizeImage.is_shopee_selected.is_(True),
+        )
+        .all()
+    )
+    return {r.product_size_id: r.image_url for r in rows}
+
+
+def _shopee_gallery_images(
+    gallery: list[ProductImage], sizes_sorted: list, wakil_map: dict
+) -> list[str]:
+    """Payload Rule: dedupe([cover] + [wakil per size XS→XXL])[:9]."""
+    ordered: list[str] = []
+    for row in gallery:
+        if row.image_url not in ordered:
+            ordered.append(row.image_url)
+    for s in sizes_sorted:
+        url = wakil_map.get(s.id)
+        if url and url not in ordered:
+            ordered.append(url)
+        if len(ordered) >= GALLERY_MAX:
+            break
+    return ordered[:GALLERY_MAX]
 
 
 def _generate_unique_sku(db: Session, name: str) -> str:
@@ -430,6 +528,207 @@ def _size_detail_with_product_out(db: Session, size: ProductSize, product: Produ
     return ProductSizeWithProductOut(**detail.model_dump(), product_sku=product.sku, product_name=product.name)
 
 
+# ---------------------------------------------------------------------------
+# v3.62: product-level gallery (max 9) + single Shopee wakil per size + payload
+# ---------------------------------------------------------------------------
+
+@router.get("/products/{sku}/images", response_model=list[ProductImageOut])
+def list_product_images(sku: str, db: Session = Depends(get_db)):
+    product = _get_product_or_404(db, sku)
+    return _gallery_ordered(db, product.id)
+
+
+@router.post("/products/{sku}/images", response_model=ProductImageOut, status_code=status.HTTP_201_CREATED)
+async def upload_product_image(
+    sku: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    product = _get_product_or_404(db, sku)
+    if file.content_type not in ["image/jpeg", "image/jpg"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format file tidak didukung. Hanya menerima file gambar JPEG.",
+        )
+    file_bytes = await file.read()
+    if len(file_bytes) > 1887436:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Ukuran file melebihi batas maksimum 1.8 MB.",
+        )
+    existing = _gallery_ordered(db, product.id)
+    if len(existing) >= GALLERY_MAX:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="GALLERY_FULL: galeri utama maksimal 9 foto.",
+        )
+    image_id = uuid.uuid4()
+    image_url = _upload_jpeg_to_gcs(f"products/{sku}/gallery/{image_id}.jpg", file_bytes)
+    row = ProductImage(
+        id=image_id,
+        product_id=product.id,
+        image_url=image_url,
+        sort_order=len(existing),
+        is_cover=(len(existing) == 0),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@router.patch("/products/{sku}/images/{image_id}", response_model=ProductImageOut)
+def patch_product_image(sku: str, image_id: uuid.UUID, body: ProductImagePatch, db: Session = Depends(get_db)):
+    product = _get_product_or_404(db, sku)
+    row = (
+        db.query(ProductImage)
+        .filter(ProductImage.id == image_id, ProductImage.product_id == product.id)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Foto tidak ditemukan.")
+    rows = _gallery_ordered(db, product.id)
+    if body.is_cover is True:
+        # Move to index 0, shift others down.
+        others = [r for r in rows if r.id != row.id]
+        ordered = [row] + others
+        for idx, r in enumerate(ordered):
+            r.sort_order = idx
+            r.is_cover = (idx == 0)
+        db.flush()
+    elif body.sort_order is not None:
+        target = max(0, min(body.sort_order, len(rows) - 1))
+        others = [r for r in rows if r.id != row.id]
+        others.insert(target, row)
+        for idx, r in enumerate(others):
+            r.sort_order = idx
+            r.is_cover = (idx == 0)
+        db.flush()
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@router.delete("/products/{sku}/images/{image_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_product_image(sku: str, image_id: uuid.UUID, db: Session = Depends(get_db)):
+    product = _get_product_or_404(db, sku)
+    row = (
+        db.query(ProductImage)
+        .filter(ProductImage.id == image_id, ProductImage.product_id == product.id)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Foto tidak ditemukan.")
+    image_url = row.image_url
+    db.delete(row)
+    db.flush()
+    _renumber_gallery(db, product.id)
+    db.commit()
+    # Best-effort GCS delete (same prefix logic as size images).
+    from app.config import settings
+    bucket_name = settings.gcs_bucket_name.strip()
+    if bucket_name.startswith("gs://"):
+        bucket_name = bucket_name[5:]
+    if bucket_name.endswith("/"):
+        bucket_name = bucket_name[:-1]
+    prefix = f"https://storage.googleapis.com/{bucket_name}/"
+    if image_url.startswith(prefix):
+        try:
+            from google.cloud import storage
+            client = storage.Client()
+            client.bucket(bucket_name).blob(image_url[len(prefix):]).delete()
+        except Exception as e:
+            print(f"GCS Delete failed: {e}. Proceeding (DB row already deleted).")
+    return
+
+
+@router.patch(
+    "/products/{sku}/sizes/{size_id}/images/{image_id}/select",
+    response_model=SizeImageSelectOut,
+)
+def select_size_shopee_image(
+    sku: str, size_id: uuid.UUID, image_id: uuid.UUID,
+    body: SizeImageSelectRequest, db: Session = Depends(get_db),
+):
+    product, size = _get_product_and_size_or_404(db, sku, size_id)
+    img = (
+        db.query(ProductSizeImage)
+        .filter(ProductSizeImage.id == image_id, ProductSizeImage.product_size_id == size.id)
+        .first()
+    )
+    if img is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Foto tidak ditemukan.")
+    gallery_synced = True
+    gallery_reason: str | None = None
+    if body.selected:
+        # Exclusive select: unset others in one transaction.
+        db.query(ProductSizeImage).filter(
+            ProductSizeImage.product_size_id == size.id,
+            ProductSizeImage.id != img.id,
+        ).update({"is_shopee_selected": False})
+        img.is_shopee_selected = True
+        db.flush()
+        # Auto-upsert wakil URL into product gallery (dedupe, respect 9-limit).
+        gallery = _gallery_ordered(db, product.id)
+        if img.image_url not in [g.image_url for g in gallery]:
+            if len(gallery) >= GALLERY_MAX:
+                gallery_synced = False
+                gallery_reason = "FULL"
+            else:
+                db.add(ProductImage(
+                    product_id=product.id,
+                    image_url=img.image_url,
+                    sort_order=len(gallery),
+                    is_cover=False,
+                ))
+                db.flush()
+    else:
+        img.is_shopee_selected = False
+        db.flush()
+    db.commit()
+    db.refresh(img)
+    return SizeImageSelectOut(
+        id=img.id,
+        product_size_id=img.product_size_id,
+        image_url=img.image_url,
+        is_shopee_selected=img.is_shopee_selected,
+        created_at=img.created_at,
+        gallery_synced=gallery_synced,
+        gallery_reason=gallery_reason,
+    )
+
+
+@router.get("/products/{sku}/shopee-payload", response_model=ShopeePayloadOut)
+def get_shopee_payload(sku: str, db: Session = Depends(get_db)):
+    product = _get_product_or_404(db, sku)
+    sizes = (
+        db.query(ProductSize)
+        .filter(
+            ProductSize.product_id == product.id,
+            ProductSize.is_archived.is_(False),
+            ProductSize.selling_price.isnot(None),
+            ProductSize.selling_price > 0,
+        )
+        .all()
+    )
+    sizes_sorted = sorted(sizes, key=lambda s: _size_sort_key(s.size_label))
+    size_ids = [s.id for s in sizes_sorted]
+    stock_map = _stock_qty_map(db, size_ids)
+    wakil_map = _size_wakil_map(db, size_ids)
+    gallery = _gallery_ordered(db, product.id)
+    images = _shopee_gallery_images(gallery, sizes_sorted, wakil_map)
+    models = [
+        ShopeeModelOut(
+            name=s.size_label,
+            price=float(s.selling_price or 0),
+            stock=int(stock_map.get(s.id, 0)),
+            image_url=wakil_map.get(s.id),
+        )
+        for s in sizes_sorted
+    ]
+    return ShopeePayloadOut(images=images, models=models)
+
+
 @router.post("/products", response_model=ProductOut, status_code=status.HTTP_201_CREATED)
 def create_product(body: ProductCreate, db: Session = Depends(get_db)):
     if body.sku is not None:
@@ -508,20 +807,26 @@ def generate_shopee_bulk_upload(db: Session):
     all_valid_sizes = []
     for product in products:
         for size in product.sizes:
-            if not size.is_archived and size.selling_price is not None and size.selling_price > 0 and size.images:
+            if not size.is_archived and size.selling_price is not None and size.selling_price > 0:
                 all_valid_sizes.append(size)
-                
+
     size_ids = [s.id for s in all_valid_sizes]
     stock_map = _stock_qty_map(db, size_ids)
-    
+
     current_row = 7
     for product in products:
         sizes = [
             s for s in product.sizes
-            if not s.is_archived and s.selling_price is not None and s.selling_price > 0 and s.images
+            if not s.is_archived and s.selling_price is not None and s.selling_price > 0
         ]
         if not sizes:
             continue
+        # v3.62: XS→XXL row order per product (mirror iOS sizeLabelSortKey).
+        sizes = sorted(sizes, key=lambda s: _size_sort_key(s.size_label))
+        # v3.62: gallery + single-wakil map for Shopee image columns.
+        _gallery = _gallery_ordered(db, product.id)
+        _wakil = _size_wakil_map(db, [s.id for s in sizes])
+        _images = _shopee_gallery_images(_gallery, sizes, _wakil)
             
         category_lower = (product.category or "").lower()
         if category_lower == "scrunchie":
@@ -604,9 +909,8 @@ Ideal untuk menyimpan makeup, skincare, dan essentials kamu — whether for dail
             else:
                 col_13 = size.size_label
                 
-            col_14 = ""
-            if size.images:
-                col_14 = size.images[0].image_url
+            # v3.62: variant photo = single selected wakil (NULL = not chosen yet).
+            col_14 = _wakil.get(size.id) or ""
                 
             col_15 = col_16 = ""
             col_17 = size.selling_price
@@ -618,36 +922,35 @@ Ideal untuk menyimpan makeup, skincare, dan essentials kamu — whether for dail
                 col_19 = f"{product.sku}-{size.size_label}".upper()
                 
             col_20 = col_21 = col_22 = ""
-            col_23 = ""
-            col_24 = ""
-            col_25 = ""
-            col_26 = ""
-            col_27 = ""
-            col_28 = ""
-            col_29 = ""
-            col_30 = ""
-            col_31 = ""
-            
-            if size.images:
-                num_imgs = len(size.images)
-                if num_imgs > 0:
-                    col_23 = size.images[0].image_url
-                if num_imgs > 1:
-                    col_24 = size.images[1].image_url
-                if num_imgs > 2:
-                    col_25 = size.images[2].image_url
-                if num_imgs > 3:
-                    col_26 = size.images[3].image_url
-                if num_imgs > 4:
-                    col_27 = size.images[4].image_url
-                if num_imgs > 5:
-                    col_28 = size.images[5].image_url
-                if num_imgs > 6:
-                    col_29 = size.images[6].image_url
-                if num_imgs > 7:
-                    col_30 = size.images[7].image_url
-                if num_imgs > 8:
-                    col_31 = size.images[8].image_url
+            # v3.62: gallery columns use the EXISTING template cells only (no structural
+            # change). Row 0 per product = full gallery (cover + image_1..8).
+            # Row 1+ per product = wakil in cover + image_1 (duplicate), rest empty.
+            col_23 = col_24 = col_25 = col_26 = ""
+            col_27 = col_28 = col_29 = col_30 = col_31 = ""
+            _row_wakil = _wakil.get(size.id) or ""
+            if idx == 0:
+                for _i in range(min(len(_images), 9)):
+                    if _i == 0:
+                        col_23 = _images[_i]
+                    elif _i == 1:
+                        col_24 = _images[_i]
+                    elif _i == 2:
+                        col_25 = _images[_i]
+                    elif _i == 3:
+                        col_26 = _images[_i]
+                    elif _i == 4:
+                        col_27 = _images[_i]
+                    elif _i == 5:
+                        col_28 = _images[_i]
+                    elif _i == 6:
+                        col_29 = _images[_i]
+                    elif _i == 7:
+                        col_30 = _images[_i]
+                    elif _i == 8:
+                        col_31 = _images[_i]
+            else:
+                col_23 = _row_wakil
+                col_24 = _row_wakil
             col_32 = weight
             col_33 = length
             col_34 = width

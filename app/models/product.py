@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Numeric, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Numeric, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -19,6 +19,10 @@ class Product(Base):
     category: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     sizes: Mapped[list["ProductSize"]] = relationship(back_populates="product")
+    # v3.62: product-level gallery (max 9, sort_order 0 = cover).
+    gallery_images: Mapped[list["ProductImage"]] = relationship(
+        back_populates="product", cascade="all, delete-orphan"
+    )
 
 
 class ProductSize(Base):
@@ -73,6 +77,26 @@ class ProductSizeImage(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     product_size_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("product_size.id", ondelete="CASCADE"), nullable=False)
     image_url: Mapped[str] = mapped_column(Text, nullable=False)
+    # v3.62: single Shopee representative photo per size (exclusive via partial
+    # unique index uq_size_shopee_selected). NULL-free boolean, default False.
+    is_shopee_selected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     product_size: Mapped["ProductSize"] = relationship(back_populates="images")
+
+
+class ProductImage(Base):
+    """v3.62: product-level gallery. sort_order 0 == cover (is_cover True)."""
+
+    __tablename__ = "product_image"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    product_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("product.id", ondelete="CASCADE"), nullable=False
+    )
+    image_url: Mapped[str] = mapped_column(Text, nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    is_cover: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    product: Mapped["Product"] = relationship(back_populates="gallery_images")

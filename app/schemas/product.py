@@ -47,7 +47,54 @@ class ProductSizeImageOut(BaseModel):
     id: uuid.UUID
     product_size_id: uuid.UUID
     image_url: str
+    # v3.62: single Shopee representative per size
+    is_shopee_selected: bool = False
     created_at: datetime
+
+
+class ProductImageOut(BaseModel):
+    """v3.62: product-level gallery item. sort_order 0 == cover."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    product_id: uuid.UUID
+    image_url: str
+    sort_order: int = 0
+    is_cover: bool = False
+    created_at: datetime
+
+
+class ProductImagePatch(BaseModel):
+    is_cover: bool | None = None
+    sort_order: int | None = None
+
+
+class SizeImageSelectRequest(BaseModel):
+    selected: bool = True
+
+
+class SizeImageSelectOut(BaseModel):
+    id: uuid.UUID
+    product_size_id: uuid.UUID
+    image_url: str
+    is_shopee_selected: bool
+    created_at: datetime
+    # v3.62 auto-sync result: did the wakil URL also land in the product gallery?
+    gallery_synced: bool = True
+    gallery_reason: str | None = None
+
+
+class ShopeeModelOut(BaseModel):
+    name: str
+    price: float
+    stock: int
+    image_url: str | None = None
+
+
+class ShopeePayloadOut(BaseModel):
+    images: list[str] = Field(default_factory=list)
+    models: list[ShopeeModelOut] = Field(default_factory=list)
 
 
 class ProductSizeCreate(BaseModel):
