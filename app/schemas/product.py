@@ -74,6 +74,13 @@ class SizeImageSelectRequest(BaseModel):
     selected: bool = True
 
 
+class GalleryAssignRequest(BaseModel):
+    """v3.62: copy a product-gallery photo into a size variant."""
+
+    gallery_image_id: uuid.UUID
+    set_as_wakil: bool = True
+
+
 class SizeImageSelectOut(BaseModel):
     id: uuid.UUID
     product_size_id: uuid.UUID

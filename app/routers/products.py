@@ -19,6 +19,7 @@ from app.models.stock import StockLedger
 from app.schemas.product import (
     AddStockFromBahanRequest,
     DeleteResultOut,
+    GalleryAssignRequest,
     HppBreakdownOut,
     HppLineItemOut,
     PaginatedResponse,
@@ -702,6 +703,57 @@ def select_size_shopee_image(
         created_at=img.created_at,
         gallery_synced=gallery_synced,
         gallery_reason=gallery_reason,
+    )
+
+
+@router.post(
+    "/products/{sku}/sizes/{size_id}/images/from-gallery",
+    response_model=SizeImageSelectOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def assign_gallery_image_to_size(
+    sku: str, size_id: uuid.UUID, body: GalleryAssignRequest, db: Session = Depends(get_db),
+):
+    """Copy a product-gallery photo into a size variant (same URL, new row).
+
+    Dedupe by URL: if the size already holds this photo, reuse the row.
+    With set_as_wakil (default True) the copied photo becomes the size's
+    exclusive Shopee representative. No gallery write, so no cover race.
+    """
+    product, size = _get_product_and_size_or_404(db, sku, size_id)
+    g = (
+        db.query(ProductImage)
+        .filter(ProductImage.id == body.gallery_image_id, ProductImage.product_id == product.id)
+        .first()
+    )
+    if g is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Foto galeri tidak ditemukan.")
+    img = (
+        db.query(ProductSizeImage)
+        .filter(ProductSizeImage.product_size_id == size.id, ProductSizeImage.image_url == g.image_url)
+        .first()
+    )
+    if img is None:
+        img = ProductSizeImage(id=uuid.uuid4(), product_size_id=size.id, image_url=g.image_url)
+        db.add(img)
+        db.flush()
+    if body.set_as_wakil:
+        db.query(ProductSizeImage).filter(
+            ProductSizeImage.product_size_id == size.id,
+            ProductSizeImage.id != img.id,
+        ).update({"is_shopee_selected": False})
+        img.is_shopee_selected = True
+        db.flush()
+    db.commit()
+    db.refresh(img)
+    return SizeImageSelectOut(
+        id=img.id,
+        product_size_id=img.product_size_id,
+        image_url=img.image_url,
+        is_shopee_selected=img.is_shopee_selected,
+        created_at=img.created_at,
+        gallery_synced=True,
+        gallery_reason=None,
     )
 
 
