@@ -150,13 +150,27 @@ def _gallery_ordered(db: Session, product_id: uuid.UUID) -> list[ProductImage]:
     )
 
 
+def _apply_gallery_order(db: Session, product_id: uuid.UUID, ordered: list[ProductImage]) -> None:
+    """Persist a gallery ordering with exactly one cover (index 0).
+
+    Two-phase write: Postgres checks the partial unique index uq_product_cover
+    per-row during flush, so flipping the new cover to TRUE while the old cover
+    is still TRUE raises UniqueViolation. Clear all covers first, flush, then
+    assign sort_order + the single cover.
+    """
+    db.query(ProductImage).filter(ProductImage.product_id == product_id).update({"is_cover": False})
+    db.flush()
+    for idx, r in enumerate(ordered):
+        r.sort_order = idx
+        r.is_cover = (idx == 0)
+    db.flush()
+
+
 def _renumber_gallery(db: Session, product_id: uuid.UUID) -> list[ProductImage]:
     """Normalize sort_order to 0..n-1 and keep is_cover == (sort_order == 0)."""
     rows = _gallery_ordered(db, product_id)
-    for idx, row in enumerate(rows):
-        row.sort_order = idx
-        row.is_cover = (idx == 0)
-    db.flush()
+    if rows:
+        _apply_gallery_order(db, product_id, rows)
     return rows
 
 
@@ -591,19 +605,12 @@ def patch_product_image(sku: str, image_id: uuid.UUID, body: ProductImagePatch, 
     if body.is_cover is True:
         # Move to index 0, shift others down.
         others = [r for r in rows if r.id != row.id]
-        ordered = [row] + others
-        for idx, r in enumerate(ordered):
-            r.sort_order = idx
-            r.is_cover = (idx == 0)
-        db.flush()
+        _apply_gallery_order(db, product.id, [row] + others)
     elif body.sort_order is not None:
         target = max(0, min(body.sort_order, len(rows) - 1))
         others = [r for r in rows if r.id != row.id]
         others.insert(target, row)
-        for idx, r in enumerate(others):
-            r.sort_order = idx
-            r.is_cover = (idx == 0)
-        db.flush()
+        _apply_gallery_order(db, product.id, others)
     db.commit()
     db.refresh(row)
     return row
