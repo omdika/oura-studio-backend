@@ -1,0 +1,11 @@
+[project]
+name = "oura-studio-backend"
+version = "3.63.0"
+description = "Oura Studios API"
+requires-python = "==3.11.*"
+dependencies = [
+  "fastapi[standard]>=0.115.0",
+]
+
+[tool.fastapi]
+entrypoint = "app.main:app"

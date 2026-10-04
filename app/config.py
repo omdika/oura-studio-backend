@@ -1,5 +1,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+import os
+
 
 class Settings(BaseSettings):
     # Supabase (handoff Section 0, v2.3) — replaces the old raw DATABASE_URL.
@@ -13,7 +15,7 @@ class Settings(BaseSettings):
     # The API key above cannot substitute for this — Postgres auth uses a separate DB password set at
     # project creation. Use the "Session pooler" or "Transaction pooler" variant, not the direct
     # db.<project-ref>.supabase.co host — that host is IPv6-only and unreachable from most IPv4 networks.
-    supabase_db_url: str
+    supabase_db_url: str = ""
 
     jwt_secret: str = "change-me-in-production"
     jwt_algorithm: str = "HS256"
@@ -23,8 +25,11 @@ class Settings(BaseSettings):
     authorized_owner_email: str = "owner@example.com"
     google_client_id: str = "change-me.apps.googleusercontent.com"
 
-    # GCS Bucket Name (v3.50)
+    # GCS Bucket Name (v3.50, legacy read-only since v3.63 — new uploads go to Supabase Storage)
     gcs_bucket_name: str = "oura-studio-prod-bucket"
+
+    # Supabase Storage bucket for product images (v3.63). Must exist and be public-read.
+    supabase_storage_bucket: str = "product-images"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -34,7 +39,9 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str:
-        return self.supabase_db_url
+        # v3.63: support FastAPI Cloud native Supabase integration (injects DATABASE_URL)
+        # while keeping the manual SUPABASE_DB_URL (pooler) path as priority.
+        return self.supabase_db_url or os.getenv("DATABASE_URL", "")
 
 
 settings = Settings()

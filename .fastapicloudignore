@@ -1,0 +1,5 @@
+.venv/
+.git/
+backups_oura-supabase-*.dump
+scripts/debug_test.py
+.continue/

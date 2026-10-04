@@ -117,29 +117,52 @@ def _size_sort_key(label: str) -> tuple[int, str]:
     return (len(_SIZE_ORDER), label or "")
 
 
-def _upload_jpeg_to_gcs(blob_name: str, file_bytes: bytes) -> str:
-    """Upload JPEG bytes to GCS, return public URL. Falls back to URL on error (dev)."""
+def _upload_jpeg_to_storage(blob_name: str, file_bytes: bytes) -> str:
+    """Upload JPEG bytes to Supabase Storage, return public URL. Raises on error (v3.63)."""
     from app.config import settings
 
-    bucket_name = settings.gcs_bucket_name.strip()
-    if bucket_name.startswith("gs://"):
-        bucket_name = bucket_name[5:]
-    if bucket_name.endswith("/"):
-        bucket_name = bucket_name[:-1]
+    import httpx
+
+    base = settings.supabase_url.rstrip("/")
+    bucket = settings.supabase_storage_bucket.strip().strip("/")
+    key = settings.supabase_service_role_key
+    url = f"{base}/storage/v1/object/{bucket}/{blob_name}"
+    headers = {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "image/jpeg"}
     try:
-        from google.cloud import storage
-        client = storage.Client()
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-        blob.upload_from_string(file_bytes, content_type="image/jpeg")
-        try:
-            blob.make_public()
-        except Exception as e:
-            print(f"GCS make_public failed: {e}. Normal if Uniform Bucket-Level Access is on.")
-        return f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+        r = httpx.post(url, content=file_bytes, headers=headers, timeout=30)
+        r.raise_for_status()
     except Exception as e:
-        print(f"GCS Upload failed: {e}. Falling back to expected GCS URL for development.")
-        return f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+        print(f"Supabase Storage upload failed: {e}.")
+        raise
+    return f"{base}/storage/v1/object/public/{bucket}/{blob_name}"
+
+
+def _delete_storage_object_by_public_url(image_url: str) -> None:
+    """Best-effort delete of a Supabase Storage object given its public URL (v3.63).
+
+    Legacy GCS URLs (storage.googleapis.com/...) are skipped silently — the DB row
+    deletion already happened, and legacy objects are intentionally left in place.
+    Never raises.
+    """
+    from app.config import settings
+
+    import httpx
+
+    base = settings.supabase_url.rstrip("/")
+    bucket = settings.supabase_storage_bucket.strip().strip("/")
+    prefix = f"{base}/storage/v1/object/public/{bucket}/"
+    if not image_url.startswith(prefix):
+        return
+    object_path = image_url[len(prefix):]
+    if not object_path:
+        return
+    try:
+        key = settings.supabase_service_role_key
+        headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+        r = httpx.delete(f"{base}/storage/v1/object/{bucket}/{object_path}", headers=headers, timeout=30)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"Supabase Storage delete failed: {e}. Proceeding (DB row already deleted).")
 
 
 def _gallery_ordered(db: Session, product_id: uuid.UUID) -> list[ProductImage]:
@@ -578,7 +601,7 @@ async def upload_product_image(
             detail="GALLERY_FULL: galeri utama maksimal 9 foto.",
         )
     image_id = uuid.uuid4()
-    image_url = _upload_jpeg_to_gcs(f"products/{sku}/gallery/{image_id}.jpg", file_bytes)
+    image_url = _upload_jpeg_to_storage(f"products/{sku}/gallery/{image_id}.jpg", file_bytes)
     row = ProductImage(
         id=image_id,
         product_id=product.id,
@@ -632,21 +655,9 @@ def delete_product_image(sku: str, image_id: uuid.UUID, db: Session = Depends(ge
     db.flush()
     _renumber_gallery(db, product.id)
     db.commit()
-    # Best-effort GCS delete (same prefix logic as size images).
-    from app.config import settings
-    bucket_name = settings.gcs_bucket_name.strip()
-    if bucket_name.startswith("gs://"):
-        bucket_name = bucket_name[5:]
-    if bucket_name.endswith("/"):
-        bucket_name = bucket_name[:-1]
-    prefix = f"https://storage.googleapis.com/{bucket_name}/"
-    if image_url.startswith(prefix):
-        try:
-            from google.cloud import storage
-            client = storage.Client()
-            client.bucket(bucket_name).blob(image_url[len(prefix):]).delete()
-        except Exception as e:
-            print(f"GCS Delete failed: {e}. Proceeding (DB row already deleted).")
+    # Best-effort Supabase Storage delete (v3.63). Legacy GCS URLs are skipped inside
+    # the helper — the DB row above is already deleted either way.
+    _delete_storage_object_by_public_url(image_url)
     return
 
 
@@ -1542,29 +1553,7 @@ async def upload_product_size_image(
 
     image_id = uuid.uuid4()
     blob_name = f"products/{sku}/sizes/{size_id}/{image_id}.jpg"
-    from app.config import settings
-
-    # Clean bucket name (remove gs:// prefix and trailing slash if present)
-    bucket_name = settings.gcs_bucket_name.strip()
-    if bucket_name.startswith("gs://"):
-        bucket_name = bucket_name[5:]
-    if bucket_name.endswith("/"):
-        bucket_name = bucket_name[:-1]
-
-    try:
-        from google.cloud import storage
-        client = storage.Client()
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-        blob.upload_from_string(file_bytes, content_type="image/jpeg")
-        try:
-            blob.make_public()
-        except Exception as e:
-            print(f"GCS make_public failed: {e}. This is normal if Uniform Bucket-Level Access is enabled.")
-        image_url = f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
-    except Exception as e:
-        print(f"GCS Upload failed: {e}. Falling back to expected GCS URL for development.")
-        image_url = f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+    image_url = _upload_jpeg_to_storage(blob_name, file_bytes)
 
     new_image = ProductSizeImage(
         id=image_id,
@@ -1598,28 +1587,10 @@ def delete_product_size_image(
             detail="Foto tidak ditemukan."
         )
 
-    # Delete from GCS
-    from app.config import settings
-    
-    # Clean bucket name
-    bucket_name = settings.gcs_bucket_name.strip()
-    if bucket_name.startswith("gs://"):
-        bucket_name = bucket_name[5:]
-    if bucket_name.endswith("/"):
-        bucket_name = bucket_name[:-1]
-
+    # Delete from Supabase Storage (best-effort, v3.63). Legacy GCS URLs are skipped
+    # inside the helper — the DB row below is deleted either way.
     image_url = image_record.image_url
-    prefix = f"https://storage.googleapis.com/{bucket_name}/"
-    if image_url.startswith(prefix):
-        blob_name = image_url[len(prefix):]
-        try:
-            from google.cloud import storage
-            client = storage.Client()
-            bucket = client.bucket(bucket_name)
-            blob = bucket.blob(blob_name)
-            blob.delete()
-        except Exception as e:
-            print(f"GCS Delete failed: {e}. Proceeding to delete from database.")
+    _delete_storage_object_by_public_url(image_url)
 
     db.delete(image_record)
     db.commit()
