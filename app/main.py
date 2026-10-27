@@ -1,8 +1,10 @@
 from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
 
 from app.routers import auth, cutting_optimizer, materials, pattern_specs, production, products, reports, sales, settings, stock, suppliers
 
 app = FastAPI(title="Oura Studios API", version="3.8.0")
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(auth.router_invitations, prefix="/api/v1")

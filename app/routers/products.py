@@ -806,6 +806,7 @@ def create_product(body: ProductCreate, db: Session = Depends(get_db)):
 
 @router.get("/products", response_model=PaginatedResponse[ProductOut])
 def list_products(
+    response: Response,
     include_archived: bool = False,
     search: str | None = None,
     page: int = Query(1, ge=1, description="Nomor halaman untuk pagination"),
@@ -826,6 +827,7 @@ def list_products(
     next_page = page + 1 if page < total_pages else None
     prev_page = page - 1 if page > 1 else None
 
+    response.headers["Cache-Control"] = "private, max-age=15"
     return PaginatedResponse[ProductOut](
         data=[ProductOut.model_validate(item) for item in items],
         total_items=total_items,
@@ -1169,6 +1171,7 @@ def get_product_size(sku: str, size_id: uuid.UUID, db: Session = Depends(get_db)
 
 @router.get("/product-sizes", response_model=PaginatedResponse[ProductSizeWithProductOut])
 def list_all_product_sizes(
+    response: Response,
     archived: bool = False,
     page: int = Query(1, ge=1, description="Nomor halaman untuk pagination"),
     limit: int = Query(50, ge=1, le=500, description="Jumlah item per halaman"),
@@ -1241,6 +1244,7 @@ def list_all_product_sizes(
     next_page = page + 1 if page < total_pages else None
     prev_page = page - 1 if page > 1 else None
 
+    response.headers["Cache-Control"] = "private, max-age=15"
     return PaginatedResponse[ProductSizeWithProductOut](
         data=data,
         total_items=total_items,
@@ -1262,6 +1266,108 @@ def get_product_size_by_id(size_id: uuid.UUID, db: Session = Depends(get_db)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product size not found")
     product = db.get(Product, size.product_id)
     return _size_detail_with_product_out(db, size, product)
+
+
+# ---------------------------------------------------------------------------
+# v3.69/3.75: slim scan endpoints
+# ---------------------------------------------------------------------------
+
+_SCAN_RESOLVE_MAX_IDS = 50
+
+
+def _scan_out(s: ProductSize, stock: tuple[int, int, int]) -> ProductSizeScanOut:
+    return ProductSizeScanOut(
+        id=s.id,
+        product_id=s.product_id,
+        product_sku=s.product.sku,
+        product_name=s.product.name,
+        size_label=s.size_label,
+        fabric_variant_name=s.fabric_variant_name,
+        current_stock_qty=stock[0],
+        production_stock_qty=stock[1],
+        manual_stock_qty=stock[2],
+        selling_price=s.selling_price,
+        is_archived=s.is_archived,
+    )
+
+
+@router.get("/product-sizes/scan-resolve", response_model=ScanResolveOut)
+def scan_resolve_sizes(
+    response: Response,
+    ids: str = Query(..., description="Comma-separated product-size UUIDs, max 50"),
+    db: Session = Depends(get_db),
+):
+    response.headers["Cache-Control"] = "private, max-age=15"
+    raw = [p.strip() for p in ids.split(",") if p.strip()]
+    if len(raw) > _SCAN_RESOLVE_MAX_IDS:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Too many ids (max {_SCAN_RESOLVE_MAX_IDS})")
+    unique: list[uuid.UUID] = []
+    seen: set[uuid.UUID] = set()
+    for part in raw:
+        try:
+            parsed = uuid.UUID(part)
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid UUID: {part}")
+        if parsed not in seen:
+            seen.add(parsed)
+            unique.append(parsed)
+    if not unique:
+        return ScanResolveOut(items=[], missing_ids=[])
+    sizes = db.query(ProductSize).options(joinedload(ProductSize.product)).filter(ProductSize.id.in_(unique)).all()
+    by_id = {s.id: s for s in sizes}
+    stock_map = _stock_all_map(db, [s.id for s in sizes])
+    items: list[ProductSizeScanOut] = []
+    missing: list[uuid.UUID] = []
+    for pid in unique:
+        s = by_id.get(pid)
+        if s is None:
+            missing.append(pid)
+            continue
+        items.append(_scan_out(s, stock_map.get(pid, (0, 0, 0))))
+    return ScanResolveOut(items=items, missing_ids=missing)
+
+
+@router.get("/product-sizes/slim", response_model=PaginatedResponse[ProductSizeScanOut])
+def list_slim_product_sizes(
+    response: Response,
+    archived: bool = False,
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=500),
+    product_id: uuid.UUID | None = None,
+    with_total: bool = Query(True),
+    db: Session = Depends(get_db),
+):
+    q = (
+        db.query(ProductSize)
+        .options(joinedload(ProductSize.product))
+        .join(Product, ProductSize.product_id == Product.id)
+        .filter(ProductSize.is_archived == archived, Product.is_archived.is_(False))
+    )
+    if product_id is not None:
+        q = q.filter(ProductSize.product_id == product_id)
+    if with_total:
+        total_items = q.count()
+        total_pages = math.ceil(total_items / limit) if total_items > 0 else 1
+        offset = (page - 1) * limit
+        sizes = q.order_by(Product.name, ProductSize.size_label).offset(offset).limit(limit).all()
+        next_page = page + 1 if page < total_pages else None
+        prev_page = page - 1 if page > 1 else None
+    else:
+        offset = (page - 1) * limit
+        sizes = q.order_by(Product.name, ProductSize.size_label).offset(offset).limit(limit + 1).all()
+        if len(sizes) > limit:
+            sizes = sizes[:limit]
+            next_page = page + 1
+        else:
+            next_page = None
+        total_items = 0
+        total_pages = 1
+        prev_page = page - 1 if page > 1 else None
+    size_ids = [s.id for s in sizes]
+    stock_map = _stock_all_map(db, size_ids)
+    data = [_scan_out(s, stock_map.get(s.id, (0, 0, 0))) for s in sizes]
+    response.headers["Cache-Control"] = "private, max-age=30"
+    return PaginatedResponse[ProductSizeScanOut](data=data, total_items=total_items, total_pages=total_pages, current_page=page, next_page=next_page, prev_page=prev_page)
 
 
 @router.patch("/products/{sku}/sizes/{size_id}", response_model=ProductSizeOut)

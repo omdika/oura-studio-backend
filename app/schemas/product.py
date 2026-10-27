@@ -187,6 +187,31 @@ class ProductSizeWithProductOut(ProductSizeDetailOut):
     product_name: str
 
 
+class ProductSizeScanOut(BaseModel):
+    """v3.69/v3.75: slim shape for QR scan flows (preload + batch revalidation)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    product_id: uuid.UUID  # v3.75
+    product_sku: str
+    product_name: str
+    size_label: str
+    fabric_variant_name: str | None = None
+    current_stock_qty: int
+    production_stock_qty: int = 0
+    manual_stock_qty: int = 0
+    selling_price: float | None = None
+    is_archived: bool = False
+
+
+class ScanResolveOut(BaseModel):
+    """v3.69: envelope for GET /product-sizes/scan-resolve."""
+
+    items: list[ProductSizeScanOut] = Field(default_factory=list)
+    missing_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
 class DeleteResultOut(BaseModel):
     deleted: bool  # True = hard-deleted, False = archived instead
 
